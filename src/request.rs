@@ -10,6 +10,7 @@ use std::{
     fmt,
     future::{Future, IntoFuture},
     hash::{Hash, Hasher},
+    net::IpAddr,
     pin::Pin,
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
@@ -23,6 +24,8 @@ use http::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use url_crate::Url;
+
+use crate::fs::Path as FsPath;
 
 const DEFAULT_USER_AGENT: &str = concat!("easy-rust/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -141,6 +144,15 @@ pub enum ErrorKind {
     #[error("request form failed")]
     FormSerialize,
 
+    /// 上传文件读取失败。
+    #[error("request upload_file `{path}` as `{field}` failed")]
+    UploadRead {
+        /// 表单字段名。
+        field: String,
+        /// 发生错误的文件路径。
+        path: FsPath,
+    },
+
     /// 请求头名称解析失败。
     #[error("request header `{name}` failed")]
     InvalidHeaderName {
@@ -198,6 +210,20 @@ pub enum ErrorKind {
     JsonDecode {
         /// 响应 URL。
         url: String,
+    },
+
+    /// 域名解析失败。
+    #[error("request lookup_host `{host}` failed")]
+    LookupHost {
+        /// 调用方传入的主机名。
+        host: String,
+    },
+
+    /// IP 地址解析失败。
+    #[error("request parse_ip `{input}` failed")]
+    InvalidIp {
+        /// 调用方传入的 IP 文本。
+        input: String,
     },
 }
 
@@ -368,6 +394,62 @@ impl Request {
         self
     }
 
+    /// 上传文件。
+    ///
+    /// 这个方法会把请求体切换为 `multipart/form-data`，字段名使用 `name`，文件名自动取路径文件名。
+    /// 文件会在这里读入内存，保证请求重试时可以重新发送。
+    #[must_use]
+    pub fn upload_file(mut self, name: impl Into<String>, path: impl Into<FsPath>) -> Self {
+        let name = name.into();
+        let path = path.into();
+        match std::fs::read(path.as_std_path()) {
+            Ok(bytes) => {
+                let file_name = path.name().unwrap_or_else(|| "file".to_owned());
+                self.push_upload(UploadPart::Bytes {
+                    name,
+                    file_name,
+                    bytes: Bytes::from(bytes),
+                });
+            }
+            Err(source) => self.store_error(Error::with_source(
+                ErrorKind::UploadRead { field: name, path },
+                source,
+            )),
+        }
+        self
+    }
+
+    /// 上传文本字段。
+    ///
+    /// 这个方法会把请求体切换为 `multipart/form-data`，适合和 [`upload_file`](Self::upload_file)
+    /// 一起提交普通文本字段。
+    #[must_use]
+    pub fn upload_text(mut self, name: impl Into<String>, text: impl Into<String>) -> Self {
+        self.push_upload(UploadPart::Text {
+            name: name.into(),
+            text: text.into(),
+        });
+        self
+    }
+
+    /// 上传内存中的字节内容。
+    ///
+    /// 需要显式传入文件名，方便服务端按普通文件字段接收。
+    #[must_use]
+    pub fn upload_bytes(
+        mut self,
+        name: impl Into<String>,
+        file_name: impl Into<String>,
+        bytes: impl AsRef<[u8]>,
+    ) -> Self {
+        self.push_upload(UploadPart::Bytes {
+            name: name.into(),
+            file_name: file_name.into(),
+            bytes: Bytes::copy_from_slice(bytes.as_ref()),
+        });
+        self
+    }
+
     /// 覆盖当前请求的总超时时间。
     ///
     /// 只影响这一条请求，不会修改全局默认 client。推荐配合 `time::seconds(5)` 这类
@@ -434,6 +516,15 @@ impl Request {
     fn store_error(&mut self, error: Error) {
         if self.pending_error.is_none() {
             self.pending_error = Some(error);
+        }
+    }
+
+    fn push_upload(&mut self, part: UploadPart) {
+        match &mut self.body {
+            Body::Multipart { parts } => parts.push(part),
+            Body::Empty | Body::Bytes { .. } => {
+                self.body = Body::Multipart { parts: vec![part] };
+            }
         }
     }
 }
@@ -701,6 +792,26 @@ impl RequestBuilder {
                 }
                 request.body(bytes.clone())
             }
+            Body::Multipart { parts } => {
+                let mut form = reqwest::multipart::Form::new();
+                for part in parts {
+                    match part {
+                        UploadPart::Text { name, text } => {
+                            form = form.text(name.clone(), text.clone());
+                        }
+                        UploadPart::Bytes {
+                            name,
+                            file_name,
+                            bytes,
+                        } => {
+                            let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+                                .file_name(file_name.clone());
+                            form = form.part(name.clone(), part);
+                        }
+                    }
+                }
+                request.multipart(form)
+            }
         }
     }
 
@@ -935,6 +1046,54 @@ pub fn request(method: impl ToString, url: impl Into<String>) -> Request {
     Request::new_raw(method, url)
 }
 
+/// 解析主机名对应的 IP 地址。
+///
+/// 返回字符串形式的 IP 列表，结果会去重并排序。这个函数只做 DNS 查询，不创建网络连接。
+pub async fn lookup_host(host: impl AsRef<str>) -> Result<Vec<String>> {
+    let host = host.as_ref();
+    let addrs = tokio::net::lookup_host((host, 0)).await.map_err(|source| {
+        Error::with_source(
+            ErrorKind::LookupHost {
+                host: host.to_owned(),
+            },
+            source,
+        )
+    })?;
+    let mut output = Vec::new();
+    for addr in addrs {
+        let ip = addr.ip().to_string();
+        if !output.contains(&ip) {
+            output.push(ip);
+        }
+    }
+    output.sort();
+    Ok(output)
+}
+
+/// 解析 IP 地址并返回规范化字符串。
+///
+/// IPv4 和 IPv6 都支持；非法输入返回 [`ErrorKind::InvalidIp`]。
+pub fn parse_ip(input: impl AsRef<str>) -> Result<String> {
+    let input = input.as_ref();
+    input
+        .parse::<IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|source| {
+            Error::with_source(
+                ErrorKind::InvalidIp {
+                    input: input.to_owned(),
+                },
+                source,
+            )
+        })
+}
+
+/// 判断文本是否是合法 IP 地址。
+#[must_use]
+pub fn is_ip(input: impl AsRef<str>) -> bool {
+    input.as_ref().parse::<IpAddr>().is_ok()
+}
+
 #[derive(Clone, Debug)]
 struct ClientConfig {
     timeout: Duration,
@@ -970,6 +1129,22 @@ enum Body {
     Bytes {
         bytes: Bytes,
         content_type: Option<HeaderValue>,
+    },
+    Multipart {
+        parts: Vec<UploadPart>,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum UploadPart {
+    Text {
+        name: String,
+        text: String,
+    },
+    Bytes {
+        name: String,
+        file_name: String,
+        bytes: Bytes,
     },
 }
 
@@ -1114,7 +1289,10 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{body_json, body_string, header, method, path, query_param},
+        matchers::{
+            body_json, body_string, body_string_contains, header, header_regex, method, path,
+            query_param,
+        },
     };
 
     use super::*;
@@ -1224,6 +1402,54 @@ mod tests {
             .await?;
 
         assert_eq!(response.text(), "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upload_methods_send_multipart_body()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        let file = std::env::temp_dir().join(format!(
+            "easy-rust-request-upload-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&file, "file body")?;
+
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .and(header_regex("content-type", "multipart/form-data"))
+            .and(body_string_contains("name=\"note\""))
+            .and(body_string_contains("hello"))
+            .and(body_string_contains("name=\"file\""))
+            .and(body_string_contains("filename=\""))
+            .and(body_string_contains("file body"))
+            .and(body_string_contains("name=\"blob\""))
+            .and(body_string_contains("filename=\"blob.bin\""))
+            .and(body_string_contains("abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("uploaded"))
+            .mount(&server)
+            .await;
+
+        let response = post(format!("{}/upload", server.uri()))
+            .upload_text("note", "hello")
+            .upload_file("file", file.display().to_string())
+            .upload_bytes("blob", "blob.bin", b"abc")
+            .await?;
+
+        assert_eq!(response.text(), "uploaded");
+        let _ = std::fs::remove_file(file);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookup_host_and_ip_helpers_work() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let ips = lookup_host("localhost").await?;
+
+        assert!(!ips.is_empty());
+        assert_eq!(parse_ip("127.0.0.1")?, "127.0.0.1");
+        assert!(is_ip("::1"));
+        assert!(!is_ip("not an ip"));
         Ok(())
     }
 

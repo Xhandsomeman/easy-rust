@@ -6,10 +6,16 @@
 use std::{
     error::Error as StdError,
     fmt,
+    path::PathBuf,
     process::{Command, ExitStatus},
+    thread,
+    time::{Duration, Instant},
 };
 
+use crate::fs::Path as FsPath;
+
 const PREVIEW_CHARS: usize = 500;
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// cmd 模块统一使用的结果类型。
 ///
@@ -105,6 +111,17 @@ pub enum ErrorKind {
         /// `stderr` 的安全长度预览。
         stderr: String,
     },
+
+    /// 命令执行超时。
+    #[error("cmd {operation} `{command}` timed out after {timeout_ms} ms")]
+    Timeout {
+        /// 发生错误的操作名，例如 `run_timeout`。
+        operation: &'static str,
+        /// 调用方执行的命令。
+        command: String,
+        /// 超时时长，单位毫秒。
+        timeout_ms: u128,
+    },
 }
 
 /// 命令执行结果。
@@ -188,7 +205,12 @@ pub fn run(command: impl AsRef<str>) -> Result<Output> {
     let command = command.as_ref();
     let parts = parse_command(command)?;
     let program = &parts[0];
-    execute(command.trim().to_owned(), program, &parts[1..])
+    execute(
+        command.trim().to_owned(),
+        program,
+        &parts[1..],
+        CommandOptions::default(),
+    )
 }
 
 /// 直接执行程序和参数。
@@ -205,7 +227,7 @@ where
         .map(|arg| arg.as_ref().to_owned())
         .collect();
     let command = format_command(&program, &args);
-    execute(command, &program, &args)
+    execute(command, &program, &args, CommandOptions::default())
 }
 
 /// 显式通过系统 shell 执行命令。
@@ -217,27 +239,224 @@ pub fn shell(command: impl AsRef<str>) -> Result<Output> {
 
     #[cfg(windows)]
     {
-        execute(command.clone(), "cmd", &["/C".to_owned(), command])
+        execute(
+            command.clone(),
+            "cmd",
+            &["/C".to_owned(), command],
+            CommandOptions::default(),
+        )
     }
 
     #[cfg(not(windows))]
     {
-        execute(command.clone(), "sh", &["-c".to_owned(), command])
+        execute(
+            command.clone(),
+            "sh",
+            &["-c".to_owned(), command],
+            CommandOptions::default(),
+        )
     }
 }
 
-fn execute(command: String, program: &str, args: &[String]) -> Result<Output> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|source| {
+/// 在指定目录执行简单命令字符串。
+pub fn run_in(dir: impl Into<FsPath>, command: impl AsRef<str>) -> Result<Output> {
+    let command = command.as_ref();
+    let parts = parse_command(command)?;
+    execute(
+        command.trim().to_owned(),
+        &parts[0],
+        &parts[1..],
+        CommandOptions::default().dir(dir.into()),
+    )
+}
+
+/// 在指定目录直接执行程序和参数。
+pub fn exec_in<A>(
+    dir: impl Into<FsPath>,
+    program: impl AsRef<str>,
+    args: impl IntoIterator<Item = A>,
+) -> Result<Output>
+where
+    A: AsRef<str>,
+{
+    let program = program.as_ref().to_owned();
+    let args = collect_args(args);
+    let command = format_command(&program, &args);
+    execute(
+        command,
+        &program,
+        &args,
+        CommandOptions::default().dir(dir.into()),
+    )
+}
+
+/// 在指定目录通过系统 shell 执行命令。
+pub fn shell_in(dir: impl Into<FsPath>, command: impl AsRef<str>) -> Result<Output> {
+    shell_with_options(
+        command.as_ref().to_owned(),
+        CommandOptions::default().dir(dir.into()),
+    )
+}
+
+/// 带环境变量执行简单命令字符串。
+pub fn run_env<K, V, I>(command: impl AsRef<str>, env: I) -> Result<Output>
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let command = command.as_ref();
+    let parts = parse_command(command)?;
+    execute(
+        command.trim().to_owned(),
+        &parts[0],
+        &parts[1..],
+        CommandOptions::default().env(env),
+    )
+}
+
+/// 带环境变量直接执行程序和参数。
+pub fn exec_env<A, K, V, I>(
+    program: impl AsRef<str>,
+    args: impl IntoIterator<Item = A>,
+    env: I,
+) -> Result<Output>
+where
+    A: AsRef<str>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let program = program.as_ref().to_owned();
+    let args = collect_args(args);
+    let command = format_command(&program, &args);
+    execute(command, &program, &args, CommandOptions::default().env(env))
+}
+
+/// 带环境变量通过系统 shell 执行命令。
+pub fn shell_env<K, V, I>(command: impl AsRef<str>, env: I) -> Result<Output>
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    shell_with_options(
+        command.as_ref().to_owned(),
+        CommandOptions::default().env(env),
+    )
+}
+
+/// 带超时执行简单命令字符串。
+pub fn run_timeout(command: impl AsRef<str>, timeout: Duration) -> Result<Output> {
+    let command = command.as_ref();
+    let parts = parse_command(command)?;
+    execute(
+        command.trim().to_owned(),
+        &parts[0],
+        &parts[1..],
+        CommandOptions::default().timeout("run_timeout", timeout),
+    )
+}
+
+/// 带超时直接执行程序和参数。
+pub fn exec_timeout<A>(
+    program: impl AsRef<str>,
+    args: impl IntoIterator<Item = A>,
+    timeout: Duration,
+) -> Result<Output>
+where
+    A: AsRef<str>,
+{
+    let program = program.as_ref().to_owned();
+    let args = collect_args(args);
+    let command = format_command(&program, &args);
+    execute(
+        command,
+        &program,
+        &args,
+        CommandOptions::default().timeout("exec_timeout", timeout),
+    )
+}
+
+/// 带超时通过系统 shell 执行命令。
+pub fn shell_timeout(command: impl AsRef<str>, timeout: Duration) -> Result<Output> {
+    shell_with_options(
+        command.as_ref().to_owned(),
+        CommandOptions::default().timeout("shell_timeout", timeout),
+    )
+}
+
+#[derive(Default)]
+struct CommandOptions {
+    dir: Option<PathBuf>,
+    env: Vec<(String, String)>,
+    timeout: Option<(Duration, &'static str)>,
+}
+
+impl CommandOptions {
+    fn dir(mut self, dir: FsPath) -> Self {
+        self.dir = Some(dir.as_std_path().to_path_buf());
+        self
+    }
+
+    fn env<K, V, I>(mut self, env: I) -> Self
+    where
+        K: AsRef<str>,
+        V: AsRef<str>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        self.env = env
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned()))
+            .collect();
+        self
+    }
+
+    fn timeout(mut self, operation: &'static str, timeout: Duration) -> Self {
+        self.timeout = Some((timeout, operation));
+        self
+    }
+}
+
+fn shell_with_options(command: String, options: CommandOptions) -> Result<Output> {
+    #[cfg(windows)]
+    {
+        execute(command.clone(), "cmd", &["/C".to_owned(), command], options)
+    }
+
+    #[cfg(not(windows))]
+    {
+        execute(command.clone(), "sh", &["-c".to_owned(), command], options)
+    }
+}
+
+fn execute(
+    command: String,
+    program: &str,
+    args: &[String],
+    options: CommandOptions,
+) -> Result<Output> {
+    let mut process = Command::new(program);
+    process.args(args);
+    if let Some(dir) = options.dir {
+        process.current_dir(dir);
+    }
+    for (key, value) in options.env {
+        process.env(key, value);
+    }
+
+    let output = if let Some((timeout, operation)) = options.timeout {
+        output_with_timeout(process, operation, &command, timeout)?
+    } else {
+        process.output().map_err(|source| {
             Error::with_source(
                 ErrorKind::Spawn {
                     command: command.clone(),
                 },
                 source,
             )
-        })?;
+        })?
+    };
 
     Ok(Output {
         command,
@@ -245,6 +464,72 @@ fn execute(command: String, program: &str, args: &[String]) -> Result<Output> {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+fn output_with_timeout(
+    mut process: Command,
+    operation: &'static str,
+    command: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut child = process.spawn().map_err(|source| {
+        Error::with_source(
+            ErrorKind::Spawn {
+                command: command.to_owned(),
+            },
+            source,
+        )
+    })?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if child
+            .try_wait()
+            .map_err(|source| {
+                Error::with_source(
+                    ErrorKind::Spawn {
+                        command: command.to_owned(),
+                    },
+                    source,
+                )
+            })?
+            .is_some()
+        {
+            return child.wait_with_output().map_err(|source| {
+                Error::with_source(
+                    ErrorKind::Spawn {
+                        command: command.to_owned(),
+                    },
+                    source,
+                )
+            });
+        }
+
+        if Instant::now() >= deadline {
+            let kill_result = child.kill();
+            let _ = child.wait();
+            let error = ErrorKind::Timeout {
+                operation,
+                command: command.to_owned(),
+                timeout_ms: timeout.as_millis(),
+            };
+            return match kill_result {
+                Ok(()) => Err(error.into()),
+                Err(source) => Err(Error::with_source(error, source)),
+            };
+        }
+
+        thread::sleep(WAIT_POLL_INTERVAL);
+    }
+}
+
+fn collect_args<A>(args: impl IntoIterator<Item = A>) -> Vec<String>
+where
+    A: AsRef<str>,
+{
+    args.into_iter()
+        .map(|arg| arg.as_ref().to_owned())
+        .collect()
 }
 
 fn parse_command(command: &str) -> Result<Vec<String>> {
@@ -347,7 +632,7 @@ fn preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error as StdError;
+    use std::{error::Error as StdError, time::Duration};
 
     use super::*;
 
@@ -411,6 +696,28 @@ mod tests {
 
         assert!(output.success());
         assert_eq!(output.stdout(), "HELLO");
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn in_env_and_timeout_variants_work_on_unix() -> std::result::Result<(), Box<dyn StdError>> {
+        let dir_output = run_in("/", "pwd")?;
+        let env_output = shell_env(
+            "printf \"$EASY_RUST_CMD_TEST\"",
+            [("EASY_RUST_CMD_TEST", "ok")],
+        )?;
+        let timeout = match shell_timeout("sleep 2", Duration::from_millis(50)) {
+            Ok(output) => return Err(format!("expected timeout, got {output:?}").into()),
+            Err(error) => error,
+        };
+
+        assert_eq!(dir_output.stdout(), "/\n");
+        assert_eq!(env_output.stdout(), "ok");
+        match timeout.kind() {
+            ErrorKind::Timeout { operation, .. } => assert_eq!(*operation, "shell_timeout"),
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
         Ok(())
     }
 

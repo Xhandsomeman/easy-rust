@@ -139,6 +139,40 @@ pub enum ErrorKind {
         /// 面向人的错误说明。
         message: String,
     },
+
+    /// 复制文件或目录失败。
+    #[error("fs copy `{from}` to `{to}` failed")]
+    Copy {
+        /// 源路径。
+        from: Path,
+        /// 目标路径。
+        to: Path,
+    },
+
+    /// 移动文件或目录失败。
+    #[error("fs move_path `{from}` to `{to}` failed")]
+    Move {
+        /// 源路径。
+        from: Path,
+        /// 目标路径。
+        to: Path,
+    },
+
+    /// 遍历目录失败。
+    #[error("fs walk `{path}` failed")]
+    Walk {
+        /// 发生错误的路径。
+        path: Path,
+    },
+
+    /// 读取路径信息失败。
+    #[error("fs {operation} `{path}` failed")]
+    Info {
+        /// 发生错误的操作名，例如 `size` 或 `absolute`。
+        operation: &'static str,
+        /// 发生错误的路径。
+        path: Path,
+    },
 }
 
 /// easy-rust 的高层路径对象。
@@ -260,6 +294,63 @@ impl Path {
     /// 文件会直接删除，目录会递归删除；路径不存在时返回成功。
     pub fn remove(&self) -> Result<()> {
         remove(self)
+    }
+
+    /// 复制当前路径到目标路径。
+    pub fn copy_to(&self, to: impl Into<Path>) -> Result<()> {
+        copy(self, to)
+    }
+
+    /// 移动当前路径到目标路径。
+    pub fn move_to(&self, to: impl Into<Path>) -> Result<()> {
+        move_path(self, to)
+    }
+
+    /// 递归列出当前目录下的所有子路径。
+    pub fn walk(&self) -> Result<Vec<Path>> {
+        walk(self)
+    }
+
+    /// 返回文件大小，目录会返回其内部普通文件大小总和。
+    pub fn size(&self) -> Result<u64> {
+        size(self)
+    }
+
+    /// 返回父目录路径。
+    ///
+    /// 没有父目录时返回 `None`。
+    #[must_use]
+    pub fn parent(&self) -> Option<Path> {
+        self.inner.parent().map(Self::from_std_path)
+    }
+
+    /// 返回扩展名。
+    ///
+    /// 扩展名不包含 `.`；没有扩展名或扩展名不是有效 UTF-8 时返回 `None`。
+    #[must_use]
+    pub fn ext(&self) -> Option<String> {
+        self.inner
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+    }
+
+    /// 返回不带扩展名的文件名。
+    ///
+    /// 没有文件名或文件名不是有效 UTF-8 时返回 `None`。
+    #[must_use]
+    pub fn stem(&self) -> Option<String> {
+        self.inner
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+    }
+
+    /// 返回绝对路径。
+    ///
+    /// 这个方法不要求路径已经存在；相对路径会基于当前工作目录转换。
+    pub fn absolute(&self) -> Result<Path> {
+        absolute(self)
     }
 }
 
@@ -480,6 +571,225 @@ pub fn remove(path: impl Into<Path>) -> Result<()> {
     };
 
     result.map_err(|source| Error::with_source(ErrorKind::Remove { path }, source))
+}
+
+/// 复制文件或目录。
+///
+/// 文件复制会自动创建目标父目录；目录复制会递归复制内部内容。目标文件已存在时会覆盖。
+pub fn copy(from: impl Into<Path>, to: impl Into<Path>) -> Result<()> {
+    let from = from.into();
+    let to = to.into();
+    copy_inner(&from, &to)
+}
+
+/// 移动文件或目录。
+///
+/// 会自动创建目标父目录。非零散文件系统场景下使用系统 rename 语义。
+pub fn move_path(from: impl Into<Path>, to: impl Into<Path>) -> Result<()> {
+    let from = from.into();
+    let to = to.into();
+    create_parent_dirs(&to)?;
+    std_fs::rename(&from.inner, &to.inner).map_err(|source| {
+        Error::with_source(
+            ErrorKind::Move {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            source,
+        )
+    })
+}
+
+/// 递归列出目录下的所有子路径。
+///
+/// 返回结果不包含根路径本身，并按显示字符串排序，保证脚本输出和测试稳定。
+pub fn walk(path: impl Into<Path>) -> Result<Vec<Path>> {
+    let path = path.into();
+    let mut output = Vec::new();
+    walk_inner(&path, &mut output)?;
+    output.sort_by_key(Path::display);
+    Ok(output)
+}
+
+/// 返回文件大小，目录会返回其内部普通文件大小总和。
+pub fn size(path: impl Into<Path>) -> Result<u64> {
+    let path = path.into();
+    size_inner(&path)
+}
+
+/// 返回绝对路径。
+///
+/// 这个函数不要求路径已经存在；相对路径会基于当前工作目录转换。
+pub fn absolute(path: impl Into<Path>) -> Result<Path> {
+    let path = path.into();
+    let full = if path.inner.is_absolute() {
+        path.inner.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| {
+                Error::with_source(
+                    ErrorKind::Info {
+                        operation: "absolute",
+                        path: path.clone(),
+                    },
+                    source,
+                )
+            })?
+            .join(&path.inner)
+    };
+    Ok(Path {
+        inner: normalize_path(full),
+    })
+}
+
+fn copy_inner(from: &Path, to: &Path) -> Result<()> {
+    let metadata = std_fs::symlink_metadata(&from.inner).map_err(|source| {
+        Error::with_source(
+            ErrorKind::Copy {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            source,
+        )
+    })?;
+
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        std_fs::create_dir_all(&to.inner).map_err(|source| {
+            Error::with_source(
+                ErrorKind::Copy {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+                source,
+            )
+        })?;
+
+        let entries = std_fs::read_dir(&from.inner).map_err(|source| {
+            Error::with_source(
+                ErrorKind::Copy {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+                source,
+            )
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                Error::with_source(
+                    ErrorKind::Copy {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                    source,
+                )
+            })?;
+            let child_from = Path {
+                inner: entry.path(),
+            };
+            let child_to = Path {
+                inner: to.inner.join(entry.file_name()),
+            };
+            copy_inner(&child_from, &child_to)?;
+        }
+        return Ok(());
+    }
+
+    create_parent_dirs(to)?;
+    std_fs::copy(&from.inner, &to.inner)
+        .map(|_| ())
+        .map_err(|source| {
+            Error::with_source(
+                ErrorKind::Copy {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+                source,
+            )
+        })
+}
+
+fn walk_inner(path: &Path, output: &mut Vec<Path>) -> Result<()> {
+    let entries = std_fs::read_dir(&path.inner)
+        .map_err(|source| Error::with_source(ErrorKind::Walk { path: path.clone() }, source))?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|source| Error::with_source(ErrorKind::Walk { path: path.clone() }, source))?;
+        let child = Path {
+            inner: entry.path(),
+        };
+        output.push(child.clone());
+        let metadata = std_fs::symlink_metadata(&child.inner).map_err(|source| {
+            Error::with_source(
+                ErrorKind::Walk {
+                    path: child.clone(),
+                },
+                source,
+            )
+        })?;
+        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            walk_inner(&child, output)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn size_inner(path: &Path) -> Result<u64> {
+    let metadata = std_fs::symlink_metadata(&path.inner).map_err(|source| {
+        Error::with_source(
+            ErrorKind::Info {
+                operation: "size",
+                path: path.clone(),
+            },
+            source,
+        )
+    })?;
+
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        let mut total = 0_u64;
+        let entries = std_fs::read_dir(&path.inner).map_err(|source| {
+            Error::with_source(
+                ErrorKind::Info {
+                    operation: "size",
+                    path: path.clone(),
+                },
+                source,
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                Error::with_source(
+                    ErrorKind::Info {
+                        operation: "size",
+                        path: path.clone(),
+                    },
+                    source,
+                )
+            })?;
+            total = total.saturating_add(size_inner(&Path {
+                inner: entry.path(),
+            })?);
+        }
+        return Ok(total);
+    }
+
+    Ok(metadata.len())
+}
+
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut output = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                output.pop();
+            }
+            other => output.push(other.as_os_str()),
+        }
+    }
+    output
 }
 
 fn create_parent_dirs(path: &Path) -> Result<()> {
@@ -736,6 +1046,62 @@ mod tests {
         }
 
         assert!(error.to_string().contains("list_dir"));
+        remove(path_text(&root))?;
+        Ok(())
+    }
+
+    #[test]
+    fn copy_move_walk_size_and_path_info_work() -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("copy-move-walk")?;
+        let src = path(path_text(&root)).join("src");
+        src.join("nested/a.txt").write_text("hello")?;
+        src.join("b.bin").write_bytes([1_u8, 2, 3])?;
+        let copied = path(path_text(&root)).join("copied");
+        let moved = path(path_text(&root)).join("moved");
+
+        copy(&src, &copied)?;
+        copied.move_to(&moved)?;
+
+        assert_eq!(moved.join("nested/a.txt").read_text()?, "hello");
+        assert_eq!(moved.size()?, 8);
+        let names: Vec<String> = moved
+            .walk()?
+            .into_iter()
+            .filter_map(|path| path.name())
+            .collect();
+        assert_eq!(names, vec!["b.bin", "nested", "a.txt"]);
+
+        let file = moved.join("nested/a.txt");
+        assert_eq!(file.ext().as_deref(), Some("txt"));
+        assert_eq!(file.stem().as_deref(), Some("a"));
+        assert!(file.parent().is_some());
+        assert!(file.absolute()?.display().contains("moved"));
+        remove(path_text(&root))?;
+        Ok(())
+    }
+
+    #[test]
+    fn copy_missing_source_returns_context_error() -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("copy-error")?;
+        let from = path(path_text(&root)).join("missing");
+        let to = path(path_text(&root)).join("to");
+
+        let error = match copy(&from, &to) {
+            Ok(()) => return Err("expected copy error".into()),
+            Err(error) => error,
+        };
+
+        match error.kind() {
+            ErrorKind::Copy {
+                from: actual,
+                to: target,
+            } => {
+                assert_eq!(actual.display(), from.display());
+                assert_eq!(target.display(), to.display());
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+        assert!(error.to_string().contains("copy"));
         remove(path_text(&root))?;
         Ok(())
     }

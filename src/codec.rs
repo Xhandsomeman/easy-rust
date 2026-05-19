@@ -1,6 +1,7 @@
 //! 极简编码 API。
 //!
-//! 这个模块提供 Base64 和十六进制编码解码。编码函数返回字符串，解码函数返回字节数组。
+//! 这个模块提供 Base64、Base58、十六进制和常用整数大小端编码。编码函数返回字符串或字节数组，
+//! 解码函数失败时返回带操作名和输入预览的错误。
 
 use std::{error::Error as StdError, fmt};
 
@@ -80,6 +81,15 @@ pub enum ErrorKind {
         input: String,
     },
 
+    /// Base58 解码失败。
+    #[error("codec {operation} `{input}` failed")]
+    Base58Decode {
+        /// 发生错误的操作名，例如 `base58_decode`。
+        operation: &'static str,
+        /// 输入内容预览。
+        input: String,
+    },
+
     /// 十六进制解码失败。
     #[error("codec {operation} `{input}` failed: {message}")]
     HexDecode {
@@ -89,6 +99,17 @@ pub enum ErrorKind {
         input: String,
         /// 面向人的十六进制错误说明。
         message: String,
+    },
+
+    /// 固定长度字节转换失败。
+    #[error("codec {operation} failed: input length must be {expected}, got {actual}")]
+    ByteLength {
+        /// 发生错误的操作名。
+        operation: &'static str,
+        /// 期望字节长度。
+        expected: usize,
+        /// 实际字节长度。
+        actual: usize,
     },
 }
 
@@ -110,6 +131,30 @@ pub fn base64_decode(input: impl AsRef<[u8]>) -> Result<Vec<u8>> {
             ErrorKind::Base64Decode {
                 operation: "base64_decode",
                 input: bytes_preview(input),
+            },
+            source,
+        )
+    })
+}
+
+/// Base58 编码。
+///
+/// 常用于区块链地址、短 token 和不易混淆的文本传输。
+#[must_use]
+pub fn base58_encode(input: impl AsRef<[u8]>) -> String {
+    bs58::encode(input.as_ref()).into_string()
+}
+
+/// Base58 解码。
+///
+/// 输入非法时返回 [`ErrorKind::Base58Decode`]，错误包含输入预览。
+pub fn base58_decode(input: impl AsRef<str>) -> Result<Vec<u8>> {
+    let input = input.as_ref();
+    bs58::decode(input).into_vec().map_err(|source| {
+        Error::with_source(
+            ErrorKind::Base58Decode {
+                operation: "base58_decode",
+                input: input_preview(input),
             },
             source,
         )
@@ -159,6 +204,90 @@ pub fn hex_decode(input: impl AsRef<str>) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// 把 `u16` 转成大端字节。
+#[must_use]
+pub fn u16_to_be_bytes(value: u16) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+/// 从大端字节读取 `u16`。
+pub fn u16_from_be_bytes(bytes: impl AsRef<[u8]>) -> Result<u16> {
+    Ok(u16::from_be_bytes(fixed_bytes(
+        "u16_from_be_bytes",
+        bytes.as_ref(),
+    )?))
+}
+
+/// 把 `u16` 转成小端字节。
+#[must_use]
+pub fn u16_to_le_bytes(value: u16) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+/// 从小端字节读取 `u16`。
+pub fn u16_from_le_bytes(bytes: impl AsRef<[u8]>) -> Result<u16> {
+    Ok(u16::from_le_bytes(fixed_bytes(
+        "u16_from_le_bytes",
+        bytes.as_ref(),
+    )?))
+}
+
+/// 把 `u32` 转成大端字节。
+#[must_use]
+pub fn u32_to_be_bytes(value: u32) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+/// 从大端字节读取 `u32`。
+pub fn u32_from_be_bytes(bytes: impl AsRef<[u8]>) -> Result<u32> {
+    Ok(u32::from_be_bytes(fixed_bytes(
+        "u32_from_be_bytes",
+        bytes.as_ref(),
+    )?))
+}
+
+/// 把 `u32` 转成小端字节。
+#[must_use]
+pub fn u32_to_le_bytes(value: u32) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+/// 从小端字节读取 `u32`。
+pub fn u32_from_le_bytes(bytes: impl AsRef<[u8]>) -> Result<u32> {
+    Ok(u32::from_le_bytes(fixed_bytes(
+        "u32_from_le_bytes",
+        bytes.as_ref(),
+    )?))
+}
+
+/// 把 `u64` 转成大端字节。
+#[must_use]
+pub fn u64_to_be_bytes(value: u64) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+/// 从大端字节读取 `u64`。
+pub fn u64_from_be_bytes(bytes: impl AsRef<[u8]>) -> Result<u64> {
+    Ok(u64::from_be_bytes(fixed_bytes(
+        "u64_from_be_bytes",
+        bytes.as_ref(),
+    )?))
+}
+
+/// 把 `u64` 转成小端字节。
+#[must_use]
+pub fn u64_to_le_bytes(value: u64) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+/// 从小端字节读取 `u64`。
+pub fn u64_from_le_bytes(bytes: impl AsRef<[u8]>) -> Result<u64> {
+    Ok(u64::from_le_bytes(fixed_bytes(
+        "u64_from_le_bytes",
+        bytes.as_ref(),
+    )?))
+}
+
 fn hex_error(input: &str, message: &str) -> Error {
     ErrorKind::HexDecode {
         operation: "hex_decode",
@@ -166,6 +295,17 @@ fn hex_error(input: &str, message: &str) -> Error {
         message: message.to_owned(),
     }
     .into()
+}
+
+fn fixed_bytes<const N: usize>(operation: &'static str, bytes: &[u8]) -> Result<[u8; N]> {
+    bytes.try_into().map_err(|_| {
+        ErrorKind::ByteLength {
+            operation,
+            expected: N,
+            actual: bytes.len(),
+        }
+        .into()
+    })
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -227,6 +367,38 @@ mod tests {
     }
 
     #[test]
+    fn base58_roundtrips_bytes() -> std::result::Result<(), Box<dyn StdError>> {
+        let encoded = base58_encode("hello");
+        let decoded = base58_decode(&encoded)?;
+
+        assert_eq!(decoded, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn integer_bytes_roundtrip() -> std::result::Result<(), Box<dyn StdError>> {
+        assert_eq!(u16_from_be_bytes(u16_to_be_bytes(0x1234))?, 0x1234);
+        assert_eq!(u16_from_le_bytes(u16_to_le_bytes(0x1234))?, 0x1234);
+        assert_eq!(
+            u32_from_be_bytes(u32_to_be_bytes(0x1234_5678))?,
+            0x1234_5678
+        );
+        assert_eq!(
+            u32_from_le_bytes(u32_to_le_bytes(0x1234_5678))?,
+            0x1234_5678
+        );
+        assert_eq!(
+            u64_from_be_bytes(u64_to_be_bytes(0x1234_5678_90ab_cdef))?,
+            0x1234_5678_90ab_cdef
+        );
+        assert_eq!(
+            u64_from_le_bytes(u64_to_le_bytes(0x1234_5678_90ab_cdef))?,
+            0x1234_5678_90ab_cdef
+        );
+        Ok(())
+    }
+
+    #[test]
     fn invalid_base64_returns_context_error() -> std::result::Result<(), Box<dyn StdError>> {
         let error = match base64_decode("not base64!") {
             Ok(value) => return Err(format!("expected base64 error, got {value:?}").into()),
@@ -252,6 +424,23 @@ mod tests {
         assert!(odd.to_string().contains("hex_decode"));
         assert!(odd.to_string().contains("abc"));
         assert!(invalid.to_string().contains("zz"));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_base58_and_integer_length_return_context_errors()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let base58 = match base58_decode("0") {
+            Ok(value) => return Err(format!("expected base58 error, got {value:?}").into()),
+            Err(error) => error,
+        };
+        let int = match u32_from_be_bytes([1_u8, 2]) {
+            Ok(value) => return Err(format!("expected integer length error, got {value}").into()),
+            Err(error) => error,
+        };
+
+        assert!(base58.to_string().contains("base58_decode"));
+        assert!(int.to_string().contains("u32_from_be_bytes"));
         Ok(())
     }
 }

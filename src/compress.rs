@@ -1,7 +1,7 @@
-//! 极简压缩包 API。
+//! 极简压缩和压缩包 API。
 //!
-//! 这个模块提供 zip/tar 的打包和解包，并自动创建输出目录或文件父目录。第一版不提供压缩等级、
-//! 加密、分卷、过滤器或 streaming API。
+//! 这个模块统一提供 gzip、zip 和 tar 的压缩、解压、打包和解包能力。输出文件会自动创建父目录，
+//! 输出目录会自动创建；不提供压缩等级、加密、分卷、过滤器或 streaming API。
 
 use std::{
     error::Error as StdError,
@@ -11,18 +11,21 @@ use std::{
     path::{Component, Path as StdPath, PathBuf},
 };
 
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use zip_crate::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::fs::Path as FsPath;
 
-/// archive 模块统一使用的结果类型。
+const INPUT_PREVIEW_BYTES: usize = 80;
+
+/// compress 模块统一使用的结果类型。
 ///
-/// 成功时返回 `T`，失败时返回 [`Error`]。常见写法是 `archive::zip("dist", "dist.zip")?;`。
+/// 成功时返回 `T`，失败时返回 [`Error`]。常见写法是 `compress::gzip_file("app.log", "app.log.gz")?;`。
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// archive 模块返回的轻量错误类型。
+/// compress 模块返回的轻量错误类型。
 ///
-/// 具体错误原因保存在 [`ErrorKind`] 中。需要区分读写、目录创建、zip 或 tar 错误时，使用
+/// 具体错误原因保存在 [`ErrorKind`] 中。需要区分读写、gzip、zip 或 tar 错误时，使用
 /// [`Error::kind`]。
 #[derive(Debug)]
 pub struct Error {
@@ -76,34 +79,49 @@ impl StdError for Error {
     }
 }
 
-/// archive 模块的具体错误原因。
+/// compress 模块的具体错误原因。
 ///
-/// 错误信息会包含操作名和路径，方便定位打包或解包失败的位置。
+/// 错误信息会包含操作名和路径或输入预览，方便定位压缩、解压、打包或解包失败的位置。
 #[derive(Debug, thiserror::Error)]
 pub enum ErrorKind {
     /// 读取文件或目录失败。
-    #[error("archive read `{path}` failed")]
+    #[error("compress {operation} read `{path}` failed")]
     Read {
+        /// 发生错误的操作名。
+        operation: &'static str,
         /// 发生错误的路径。
         path: FsPath,
     },
 
     /// 写入文件失败。
-    #[error("archive write `{path}` failed")]
+    #[error("compress {operation} write `{path}` failed")]
     Write {
+        /// 发生错误的操作名。
+        operation: &'static str,
         /// 发生错误的路径。
         path: FsPath,
     },
 
     /// 创建目录失败。
-    #[error("archive create_dir `{path}` failed")]
-    CreateDir {
+    #[error("compress {operation} make_dir `{path}` failed")]
+    MakeDir {
+        /// 发生错误的操作名。
+        operation: &'static str,
         /// 发生错误的目录路径。
         path: FsPath,
     },
 
+    /// gzip 处理失败。
+    #[error("compress {operation} `{input}` failed")]
+    Gzip {
+        /// 发生错误的操作名，例如 `gzip` 或 `gunzip`。
+        operation: &'static str,
+        /// 输入内容或路径的短预览。
+        input: String,
+    },
+
     /// zip 处理失败。
-    #[error("archive {operation} `{path}` failed")]
+    #[error("compress {operation} `{path}` failed")]
     Zip {
         /// 发生错误的操作名，例如 `zip` 或 `unzip`。
         operation: &'static str,
@@ -112,7 +130,7 @@ pub enum ErrorKind {
     },
 
     /// tar 处理失败。
-    #[error("archive {operation} `{path}` failed")]
+    #[error("compress {operation} `{path}` failed")]
     Tar {
         /// 发生错误的操作名，例如 `tar` 或 `untar`。
         operation: &'static str,
@@ -121,7 +139,7 @@ pub enum ErrorKind {
     },
 
     /// 压缩包路径形状不合法。
-    #[error("archive {operation} `{path}` failed: {message}")]
+    #[error("compress {operation} `{path}` failed: {message}")]
     Shape {
         /// 发生错误的操作名。
         operation: &'static str,
@@ -132,14 +150,77 @@ pub enum ErrorKind {
     },
 }
 
+/// gzip 压缩字节内容。
+///
+/// 返回 gzip 格式的字节数组。适合压缩内存中的文本、JSON 或二进制内容。
+pub fn gzip(input: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+    let input = input.as_ref();
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(input)
+        .map_err(|source| gzip_error("gzip", bytes_preview(input), source))?;
+    encoder
+        .finish()
+        .map_err(|source| gzip_error("gzip", bytes_preview(input), source))
+}
+
+/// 解压 gzip 字节内容。
+///
+/// 输入不是合法 gzip 时返回 [`ErrorKind::Gzip`]，错误包含输入预览。
+pub fn gunzip(input: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+    let input = input.as_ref();
+    let mut decoder = GzDecoder::new(input);
+    let mut output = Vec::new();
+    decoder
+        .read_to_end(&mut output)
+        .map_err(|source| gzip_error("gunzip", bytes_preview(input), source))?;
+    Ok(output)
+}
+
+/// 把文件压缩成 gzip 文件。
+///
+/// 输出文件父目录会自动创建。输入文件会完整读入内存，适合常见脚本和后端工具场景。
+pub fn gzip_file(input: impl Into<FsPath>, output: impl Into<FsPath>) -> Result<()> {
+    let input = input.into();
+    let output = output.into();
+    let bytes = std_fs::read(input.as_std_path())
+        .map_err(|source| read_error("gzip_file", &input, source))?;
+    let compressed = gzip(&bytes)?;
+    create_parent_dirs("gzip_file", &output)?;
+    std_fs::write(output.as_std_path(), compressed)
+        .map_err(|source| write_error("gzip_file", &output, source))
+}
+
+/// 解压 gzip 文件。
+///
+/// 输出文件父目录会自动创建。输入不是合法 gzip 时返回 [`ErrorKind::Gzip`]。
+pub fn gunzip_file(input: impl Into<FsPath>, output: impl Into<FsPath>) -> Result<()> {
+    let input = input.into();
+    let output = output.into();
+    let bytes = std_fs::read(input.as_std_path())
+        .map_err(|source| read_error("gunzip_file", &input, source))?;
+    let decompressed = gunzip(&bytes).map_err(|error| match *error.kind {
+        ErrorKind::Gzip { .. } => ErrorKind::Gzip {
+            operation: "gunzip_file",
+            input: input.display(),
+        }
+        .into(),
+        other => Error::new(other),
+    })?;
+    create_parent_dirs("gunzip_file", &output)?;
+    std_fs::write(output.as_std_path(), decompressed)
+        .map_err(|source| write_error("gunzip_file", &output, source))
+}
+
 /// 把文件或目录打包成 zip。
 ///
 /// 输出文件的父目录会自动创建。目录会以目录名作为 zip 根路径，文件会以文件名作为 zip 根路径。
 pub fn zip(src: impl Into<FsPath>, dest: impl Into<FsPath>) -> Result<()> {
     let src = src.into();
     let dest = dest.into();
-    create_parent_dirs(&dest)?;
-    let file = File::create(dest.as_std_path()).map_err(|source| write_error(&dest, source))?;
+    create_parent_dirs("zip", &dest)?;
+    let file =
+        File::create(dest.as_std_path()).map_err(|source| write_error("zip", &dest, source))?;
     let mut writer = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let root = root_name(&src, "zip")?;
@@ -157,8 +238,8 @@ pub fn zip(src: impl Into<FsPath>, dest: impl Into<FsPath>) -> Result<()> {
 pub fn unzip(src: impl Into<FsPath>, dest: impl Into<FsPath>) -> Result<()> {
     let src = src.into();
     let dest = dest.into();
-    create_dir(&dest)?;
-    let file = File::open(src.as_std_path()).map_err(|source| read_error(&src, source))?;
+    create_dir("unzip", &dest)?;
+    let file = File::open(src.as_std_path()).map_err(|source| read_error("unzip", &src, source))?;
     let mut archive = ZipArchive::new(file).map_err(|source| zip_error("unzip", &src, source))?;
 
     for index in 0..archive.len() {
@@ -173,20 +254,21 @@ pub fn unzip(src: impl Into<FsPath>, dest: impl Into<FsPath>) -> Result<()> {
         let output = dest.as_std_path().join(enclosed);
 
         if entry.is_dir() {
-            std_fs::create_dir_all(&output)
-                .map_err(|source| create_dir_error(FsPath::from_std_path(&output), source))?;
+            std_fs::create_dir_all(&output).map_err(|source| {
+                make_dir_error("unzip", FsPath::from_std_path(&output), source)
+            })?;
             continue;
         }
 
         if let Some(parent) = output.parent() {
             std_fs::create_dir_all(parent)
-                .map_err(|source| create_dir_error(FsPath::from_std_path(parent), source))?;
+                .map_err(|source| make_dir_error("unzip", FsPath::from_std_path(parent), source))?;
         }
 
         let mut file = File::create(&output)
-            .map_err(|source| write_error(&FsPath::from_std_path(&output), source))?;
+            .map_err(|source| write_error("unzip", &FsPath::from_std_path(&output), source))?;
         io::copy(&mut entry, &mut file)
-            .map_err(|source| write_error(&FsPath::from_std_path(&output), source))?;
+            .map_err(|source| write_error("unzip", &FsPath::from_std_path(&output), source))?;
     }
 
     Ok(())
@@ -194,12 +276,13 @@ pub fn unzip(src: impl Into<FsPath>, dest: impl Into<FsPath>) -> Result<()> {
 
 /// 把文件或目录打包成 tar。
 ///
-/// 输出文件的父目录会自动创建。第一版只处理普通 tar，不做 gzip/xz/zstd 压缩。
+/// 输出文件的父目录会自动创建。第一版只处理普通 tar，不做 tar.gz/xz/zstd。
 pub fn tar(src: impl Into<FsPath>, dest: impl Into<FsPath>) -> Result<()> {
     let src = src.into();
     let dest = dest.into();
-    create_parent_dirs(&dest)?;
-    let file = File::create(dest.as_std_path()).map_err(|source| write_error(&dest, source))?;
+    create_parent_dirs("tar", &dest)?;
+    let file =
+        File::create(dest.as_std_path()).map_err(|source| write_error("tar", &dest, source))?;
     let mut builder = tar_crate::Builder::new(file);
     let root = root_name(&src, "tar")?;
 
@@ -221,12 +304,12 @@ pub fn tar(src: impl Into<FsPath>, dest: impl Into<FsPath>) -> Result<()> {
 
 /// 解包 tar 文件到目录。
 ///
-/// 输出目录会自动创建。第一版只处理普通 tar，不做 gzip/xz/zstd 解压。
+/// 输出目录会自动创建。tar 内部路径必须是相对安全路径，非法路径会返回 [`ErrorKind::Shape`]。
 pub fn untar(src: impl Into<FsPath>, dest: impl Into<FsPath>) -> Result<()> {
     let src = src.into();
     let dest = dest.into();
-    create_dir(&dest)?;
-    let file = File::open(src.as_std_path()).map_err(|source| read_error(&src, source))?;
+    create_dir("untar", &dest)?;
+    let file = File::open(src.as_std_path()).map_err(|source| read_error("untar", &src, source))?;
     let mut archive = tar_crate::Archive::new(file);
     let entries = archive
         .entries()
@@ -252,7 +335,7 @@ fn add_zip_path(
     options: SimpleFileOptions,
 ) -> Result<()> {
     let metadata = std_fs::metadata(path)
-        .map_err(|source| read_error(&FsPath::from_std_path(path), source))?;
+        .map_err(|source| read_error("zip", &FsPath::from_std_path(path), source))?;
 
     if metadata.is_dir() {
         let name = zip_name(archive_path);
@@ -261,9 +344,10 @@ fn add_zip_path(
             .map_err(|source| zip_error("zip", &FsPath::from_std_path(path), source))?;
 
         for entry in std_fs::read_dir(path)
-            .map_err(|source| read_error(&FsPath::from_std_path(path), source))?
+            .map_err(|source| read_error("zip", &FsPath::from_std_path(path), source))?
         {
-            let entry = entry.map_err(|source| read_error(&FsPath::from_std_path(path), source))?;
+            let entry =
+                entry.map_err(|source| read_error("zip", &FsPath::from_std_path(path), source))?;
             add_zip_path(
                 writer,
                 &entry.path(),
@@ -276,14 +360,14 @@ fn add_zip_path(
         writer
             .start_file(&name, options)
             .map_err(|source| zip_error("zip", &FsPath::from_std_path(path), source))?;
-        let mut file =
-            File::open(path).map_err(|source| read_error(&FsPath::from_std_path(path), source))?;
+        let mut file = File::open(path)
+            .map_err(|source| read_error("zip", &FsPath::from_std_path(path), source))?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)
-            .map_err(|source| read_error(&FsPath::from_std_path(path), source))?;
+            .map_err(|source| read_error("zip", &FsPath::from_std_path(path), source))?;
         writer
             .write_all(&buffer)
-            .map_err(|source| write_error(&FsPath::from_std_path(path), source))?;
+            .map_err(|source| write_error("zip", &FsPath::from_std_path(path), source))?;
     }
 
     Ok(())
@@ -328,32 +412,48 @@ fn validate_archive_path(path: &StdPath, operation: &'static str, archive: &FsPa
     Ok(())
 }
 
-fn create_parent_dirs(path: &FsPath) -> Result<()> {
+fn create_parent_dirs(operation: &'static str, path: &FsPath) -> Result<()> {
     if let Some(parent) = path.as_std_path().parent()
         && !parent.as_os_str().is_empty()
     {
         std_fs::create_dir_all(parent)
-            .map_err(|source| create_dir_error(FsPath::from_std_path(parent), source))?;
+            .map_err(|source| make_dir_error(operation, FsPath::from_std_path(parent), source))?;
     }
 
     Ok(())
 }
 
-fn create_dir(path: &FsPath) -> Result<()> {
+fn create_dir(operation: &'static str, path: &FsPath) -> Result<()> {
     std_fs::create_dir_all(path.as_std_path())
-        .map_err(|source| create_dir_error(path.clone(), source))
+        .map_err(|source| make_dir_error(operation, path.clone(), source))
 }
 
-fn read_error(path: &FsPath, source: io::Error) -> Error {
-    Error::with_source(ErrorKind::Read { path: path.clone() }, source)
+fn read_error(operation: &'static str, path: &FsPath, source: io::Error) -> Error {
+    Error::with_source(
+        ErrorKind::Read {
+            operation,
+            path: path.clone(),
+        },
+        source,
+    )
 }
 
-fn write_error(path: &FsPath, source: io::Error) -> Error {
-    Error::with_source(ErrorKind::Write { path: path.clone() }, source)
+fn write_error(operation: &'static str, path: &FsPath, source: io::Error) -> Error {
+    Error::with_source(
+        ErrorKind::Write {
+            operation,
+            path: path.clone(),
+        },
+        source,
+    )
 }
 
-fn create_dir_error(path: FsPath, source: io::Error) -> Error {
-    Error::with_source(ErrorKind::CreateDir { path }, source)
+fn make_dir_error(operation: &'static str, path: FsPath, source: io::Error) -> Error {
+    Error::with_source(ErrorKind::MakeDir { operation, path }, source)
+}
+
+fn gzip_error(operation: &'static str, input: String, source: io::Error) -> Error {
+    Error::with_source(ErrorKind::Gzip { operation, input }, source)
 }
 
 fn zip_error(operation: &'static str, path: &FsPath, source: zip_crate::result::ZipError) -> Error {
@@ -376,6 +476,17 @@ fn tar_error(operation: &'static str, path: &FsPath, source: io::Error) -> Error
     )
 }
 
+fn bytes_preview(input: &[u8]) -> String {
+    let mut output = String::new();
+    for byte in input.iter().take(INPUT_PREVIEW_BYTES) {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    if input.len() > INPUT_PREVIEW_BYTES {
+        output.push_str("...");
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -389,7 +500,7 @@ mod tests {
     fn temp_root(test_name: &str) -> std::result::Result<PathBuf, Box<dyn StdError>> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "easy-rust-archive-{}-{test_name}-{nanos}",
+            "easy-rust-compress-{}-{test_name}-{nanos}",
             std::process::id()
         ));
         test_fs::create_dir_all(&root)?;
@@ -398,6 +509,41 @@ mod tests {
 
     fn path_text(path: &std::path::Path) -> String {
         path.display().to_string()
+    }
+
+    #[test]
+    fn gzip_and_gunzip_roundtrip_bytes() -> std::result::Result<(), Box<dyn StdError>> {
+        let compressed = gzip("hello gzip")?;
+        let decompressed = gunzip(compressed)?;
+
+        assert_eq!(decompressed, b"hello gzip");
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_file_and_gunzip_file_roundtrip() -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("gzip-file")?;
+        let input = root.join("input.txt");
+        let compressed = root.join("out/input.txt.gz");
+        let output = root.join("out/input.txt");
+        test_fs::write(&input, "hello file")?;
+
+        gzip_file(path_text(&input), path_text(&compressed))?;
+        gunzip_file(path_text(&compressed), path_text(&output))?;
+
+        assert_eq!(test_fs::read_to_string(output)?, "hello file");
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_gzip_returns_context_error() -> std::result::Result<(), Box<dyn StdError>> {
+        let error = match gunzip("not gzip") {
+            Ok(value) => return Err(format!("expected gzip error, got {value:?}").into()),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("gunzip"));
+        Ok(())
     }
 
     #[test]
@@ -484,7 +630,7 @@ mod tests {
         };
 
         match error.kind() {
-            ErrorKind::Read { .. } => {}
+            ErrorKind::Read { operation, .. } => assert_eq!(*operation, "zip"),
             other => return Err(format!("unexpected error: {other}").into()),
         }
 
