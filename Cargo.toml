@@ -1,6 +1,6 @@
 [package]
 name = "easy-rust"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.94"
 description = "Python-like ergonomics for production-grade Rust."

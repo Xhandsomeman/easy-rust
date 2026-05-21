@@ -80,6 +80,70 @@ pub fn clean(text: impl AsRef<str>) -> String {
         .join(" ")
 }
 
+/// 把 HTML 转成可读文本。
+///
+/// 会去掉标签、解码常见 HTML 特殊字符写法，并使用 [`clean`] 清理连续空白。适合从网页片段中
+/// 提取简单正文，不做 JavaScript 渲染或复杂排版还原。
+#[must_use]
+pub fn html_to_text(html: impl AsRef<str>) -> String {
+    let fragment = scraper_crate::Html::parse_fragment(html.as_ref());
+    clean(html_decode(
+        fragment.root_element().text().collect::<Vec<_>>().join(" "),
+    ))
+}
+
+/// 解码 HTML 特殊字符写法。
+///
+/// 适合处理 API、RSS、meta 字段或数据库文本中的 `&amp;`、`&lt;`、`&#19990;`、`&#x4e16;`。
+/// 未知或非法写法会原样保留，避免破坏原始文本。
+#[must_use]
+pub fn html_decode(text: impl AsRef<str>) -> String {
+    let mut output = String::with_capacity(text.as_ref().len());
+    let mut rest = text.as_ref();
+
+    while let Some(start) = rest.find('&') {
+        output.push_str(&rest[..start]);
+        let after_amp = &rest[start + 1..];
+
+        let Some(end) = after_amp.find(';') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+
+        let name = &after_amp[..end];
+        if let Some(decoded) = decode_html_name(name) {
+            output.push_str(&decoded);
+        } else {
+            output.push('&');
+            output.push_str(name);
+            output.push(';');
+        }
+
+        rest = &after_amp[end + 1..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
+/// 把全角 ASCII 转成半角 ASCII。
+///
+/// 会把全角空格转成普通空格，把全角字母、数字和常见 ASCII 标点转成半角。不会处理假名、繁简
+/// 或更广泛的 Unicode 归一化。
+#[must_use]
+pub fn to_half_width(text: impl AsRef<str>) -> String {
+    text.as_ref()
+        .chars()
+        .map(|character| match character {
+            '\u{3000}' => ' ',
+            '\u{ff01}'..='\u{ff5e}' => {
+                char::from_u32(u32::from(character) - 0xfee0).unwrap_or(character)
+            }
+            _ => character,
+        })
+        .collect()
+}
+
 /// 按字符数量截断字符串。
 ///
 /// `max_chars` 是 Unicode 字符数量，不会截断到 UTF-8 字节中间。长度未超过限制时返回原文本。
@@ -211,6 +275,39 @@ fn title_word(word: &str) -> String {
         .collect()
 }
 
+fn decode_html_name(name: &str) -> Option<String> {
+    let character = match name {
+        "amp" => return Some("&".to_owned()),
+        "lt" => return Some("<".to_owned()),
+        "gt" => return Some(">".to_owned()),
+        "quot" => return Some("\"".to_owned()),
+        "apos" => return Some("'".to_owned()),
+        "nbsp" => return Some(" ".to_owned()),
+        "ldquo" => return Some("\u{201c}".to_owned()),
+        "rdquo" => return Some("\u{201d}".to_owned()),
+        "lsquo" => return Some("\u{2018}".to_owned()),
+        "rsquo" => return Some("\u{2019}".to_owned()),
+        "hellip" => return Some("\u{2026}".to_owned()),
+        "mdash" => return Some("\u{2014}".to_owned()),
+        "ndash" => return Some("\u{2013}".to_owned()),
+        decimal if decimal.starts_with('#') => decode_html_number(decimal)?,
+        _ => return None,
+    };
+    Some(character.to_string())
+}
+
+fn decode_html_number(name: &str) -> Option<char> {
+    let number = &name[1..];
+    let value = number
+        .strip_prefix('x')
+        .or_else(|| number.strip_prefix('X'))
+        .map_or_else(
+            || number.parse::<u32>().ok(),
+            |hex| u32::from_str_radix(hex, 16).ok(),
+        )?;
+    char::from_u32(value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
@@ -220,6 +317,31 @@ mod tests {
     #[test]
     fn clean_collapses_whitespace() {
         assert_eq!(clean("  hello \n  world\t "), "hello world");
+    }
+
+    #[test]
+    fn html_to_text_removes_tags_and_decodes_html_text() {
+        let html =
+            r#"<main><h1>Ada&nbsp;&amp;&nbsp;Grace</h1><p>Hello <b>Rust</b> &lt;3</p></main>"#;
+
+        assert_eq!(html_to_text(html), "Ada & Grace Hello Rust <3");
+    }
+
+    #[test]
+    fn html_decode_decodes_known_and_numeric_html_text() {
+        let text = "&ldquo;标题&rdquo;&hellip;&#x4e16;&#30028;&amp;nbsp;";
+
+        assert_eq!(html_decode(text), "\u{201c}标题\u{201d}\u{2026}世界&nbsp;");
+        assert_eq!(
+            html_decode("&unknown; &#xzz; &#99999999; &amp"),
+            "&unknown; &#xzz; &#99999999; &amp"
+        );
+    }
+
+    #[test]
+    fn to_half_width_converts_full_width_ascii() {
+        assert_eq!(to_half_width("ＡＢＣ１２３　test！＠＃"), "ABC123 test!@#");
+        assert_eq!(to_half_width("カタカナ"), "カタカナ");
     }
 
     #[test]

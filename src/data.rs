@@ -153,6 +153,32 @@ where
     iter.into_iter().collect()
 }
 
+/// 把元素连接成字符串。
+///
+/// 这是 `items.join(sep)` 的函数式入口，适合把数字、字符串或其它可转成文本的元素拼成一行。
+/// 空列表会返回空字符串。
+#[must_use]
+pub fn join<I>(items: I, sep: impl AsRef<str>) -> String
+where
+    I: IntoIterator,
+    I::Item: ToString,
+{
+    let sep = sep.as_ref();
+    let mut output = String::new();
+    let mut first = true;
+
+    for item in items {
+        if first {
+            first = false;
+        } else {
+            output.push_str(sep);
+        }
+        output.push_str(&item.to_string());
+    }
+
+    output
+}
+
 /// 把任意迭代器收集成集合。
 ///
 /// 使用标准库 [`HashSet`]；不承诺迭代顺序。重复元素会自动去重。
@@ -321,6 +347,14 @@ mod tests {
 
         assert_eq!(doubled, vec![2, 4, 6]);
         assert_eq!(evens, vec![2, 4]);
+    }
+
+    #[test]
+    fn join_turns_items_into_text() {
+        assert_eq!(join(["a", "b", "c"], ","), "a,b,c");
+        assert_eq!(join([1, 2, 3], "-"), "1-2-3");
+        assert_eq!(join(["only"], ","), "only");
+        assert_eq!(join(Vec::<String>::new(), ","), "");
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub struct Error {
     kind: ErrorKind,
-    source: Option<Box<dyn StdError + 'static>>,
+    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
 }
 
 impl Error {
@@ -24,7 +24,7 @@ impl Error {
         Self { kind, source: None }
     }
 
-    fn with_source(kind: ErrorKind, source: impl StdError + 'static) -> Self {
+    fn with_source(kind: ErrorKind, source: impl StdError + Send + Sync + 'static) -> Self {
         Self {
             kind,
             source: Some(Box::new(source)),
@@ -58,7 +58,9 @@ impl fmt::Display for Error {
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source.as_deref()
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn StdError + 'static))
     }
 }
 
@@ -75,6 +77,72 @@ pub enum ErrorKind {
         /// 用户传入的正则表达式。
         pattern: String,
     },
+}
+
+/// 可重复使用的高层正则对象。
+///
+/// 使用 [`new`] 创建。适合在循环或服务热路径里复用同一个 pattern，避免每次调用短入口都重新
+/// 编译正则。这个类型不暴露底层正则库类型。
+#[derive(Clone, Debug)]
+pub struct Regex {
+    inner: regex_crate::Regex,
+}
+
+impl Regex {
+    /// 判断文本是否匹配当前正则。
+    #[must_use]
+    pub fn is_match(&self, text: impl AsRef<str>) -> bool {
+        self.inner.is_match(text.as_ref())
+    }
+
+    /// 查找第一个匹配文本。
+    ///
+    /// 没有匹配时返回 `None`。
+    #[must_use]
+    pub fn find(&self, text: impl AsRef<str>) -> Option<String> {
+        self.inner
+            .find(text.as_ref())
+            .map(|matched| matched.as_str().to_owned())
+    }
+
+    /// 查找全部匹配文本。
+    ///
+    /// 没有匹配时返回空列表；结果按文本中出现顺序返回。
+    #[must_use]
+    pub fn find_all(&self, text: impl AsRef<str>) -> Vec<String> {
+        self.inner
+            .find_iter(text.as_ref())
+            .map(|matched| matched.as_str().to_owned())
+            .collect()
+    }
+
+    /// 替换全部匹配文本。
+    ///
+    /// replacement 使用正则替换字符串语义，例如 `$1` 表示第一个捕获组。
+    #[must_use]
+    pub fn replace(&self, text: impl AsRef<str>, replacement: impl AsRef<str>) -> String {
+        self.inner
+            .replace_all(text.as_ref(), replacement.as_ref())
+            .into_owned()
+    }
+
+    /// 按正则表达式分割文本。
+    ///
+    /// 返回值保留空片段，方便调用方按自己的规则处理。
+    #[must_use]
+    pub fn split(&self, text: impl AsRef<str>) -> Vec<String> {
+        self.inner
+            .split(text.as_ref())
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+}
+
+/// 编译可重复使用的正则对象。
+///
+/// 适合循环或服务热路径。pattern 非法时返回 [`ErrorKind::Pattern`]。
+pub fn new(pattern: impl AsRef<str>) -> Result<Regex> {
+    compile("new", pattern.as_ref()).map(|inner| Regex { inner })
 }
 
 /// 判断文本是否匹配正则表达式。
@@ -167,6 +235,24 @@ mod tests {
     }
 
     #[test]
+    fn compiled_regex_can_be_reused() -> std::result::Result<(), Box<dyn StdError>> {
+        let regex = new(r"\d+")?;
+
+        assert!(regex.is_match("room 42"));
+        assert_eq!(regex.find("room 42"), Some("42".to_owned()));
+        assert_eq!(
+            regex.find_all("a1 b22"),
+            vec!["1".to_owned(), "22".to_owned()]
+        );
+        assert_eq!(regex.replace("room 42", "#"), "room #");
+        assert_eq!(
+            new(r"\s*,\s*")?.split("a, b, c"),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn invalid_pattern_returns_context_error() -> std::result::Result<(), Box<dyn StdError>> {
         let error = match is_match("[", "text") {
             Ok(value) => return Err(format!("expected pattern error, got {value}").into()),
@@ -175,6 +261,12 @@ mod tests {
 
         assert!(error.to_string().contains("is_match"));
         assert!(error.to_string().contains("["));
+
+        let new_error = match new("[") {
+            Ok(value) => return Err(format!("expected pattern error, got {value:?}").into()),
+            Err(error) => error,
+        };
+        assert!(new_error.to_string().contains("new"));
         Ok(())
     }
 }

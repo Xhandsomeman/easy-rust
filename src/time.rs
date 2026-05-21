@@ -26,7 +26,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub struct Error {
     kind: ErrorKind,
-    source: Option<Box<dyn StdError + 'static>>,
+    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
 }
 
 impl Error {
@@ -34,7 +34,7 @@ impl Error {
         Self { kind, source: None }
     }
 
-    fn with_source(kind: ErrorKind, source: impl StdError + 'static) -> Self {
+    fn with_source(kind: ErrorKind, source: impl StdError + Send + Sync + 'static) -> Self {
         Self {
             kind,
             source: Some(Box::new(source)),
@@ -68,7 +68,9 @@ impl fmt::Display for Error {
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source.as_deref()
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn StdError + 'static))
     }
 }
 
@@ -238,6 +240,20 @@ pub fn sleep_seconds(seconds: u64) {
     thread::sleep(Duration::from_secs(seconds));
 }
 
+/// 异步睡眠指定毫秒数。
+///
+/// 这个函数适合 Tokio 异步代码，调用时使用 `time::sleep_ms_async(100).await`。
+pub async fn sleep_ms_async(ms: u64) {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// 异步睡眠指定秒数。
+///
+/// 这个函数适合 Tokio 异步代码，调用时使用 `time::sleep_secs_async(1).await`。
+pub async fn sleep_secs_async(seconds: u64) {
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+}
+
 /// 创建秒级时间长度。
 ///
 /// 适合给缓存 TTL、请求超时等 API 传入简单秒数，例如 `cache.set_ttl("token", value, time::seconds(60))`。
@@ -386,6 +402,12 @@ mod tests {
     #[test]
     fn sleep_zero_seconds_returns() {
         sleep_seconds(0);
+    }
+
+    #[tokio::test]
+    async fn async_sleep_helpers_return() {
+        sleep_ms_async(0).await;
+        sleep_secs_async(0).await;
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub struct Error {
     kind: Box<ErrorKind>,
-    source: Option<Box<dyn StdError + 'static>>,
+    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
 }
 
 impl Error {
@@ -32,7 +32,7 @@ impl Error {
         }
     }
 
-    fn with_source(kind: ErrorKind, source: impl StdError + 'static) -> Self {
+    fn with_source(kind: ErrorKind, source: impl StdError + Send + Sync + 'static) -> Self {
         Self {
             kind: Box::new(kind),
             source: Some(Box::new(source)),
@@ -66,7 +66,9 @@ impl fmt::Display for Error {
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source.as_deref()
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn StdError + 'static))
     }
 }
 
@@ -193,6 +195,48 @@ impl Url {
                     source,
                 )
             })
+    }
+
+    /// 添加一个查询参数并返回新 URL。
+    ///
+    /// 原 URL 不会被修改。键和值会按查询串规则编码，空格会编码为 `+`。
+    #[must_use]
+    pub fn add_query(&self, key: impl AsRef<str>, value: impl ToString) -> Self {
+        let mut inner = self.inner.clone();
+        inner
+            .query_pairs_mut()
+            .append_pair(key.as_ref(), &value.to_string());
+        Self { inner }
+    }
+
+    /// 添加多个查询参数并返回新 URL。
+    ///
+    /// 原 URL 不会被修改。已有查询参数会保留，新参数会追加到末尾。
+    #[must_use]
+    pub fn add_queries<K, V, I>(&self, items: I) -> Self
+    where
+        K: AsRef<str>,
+        V: ToString,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let mut inner = self.inner.clone();
+        {
+            let mut query = inner.query_pairs_mut();
+            for (key, value) in items {
+                query.append_pair(key.as_ref(), &value.to_string());
+            }
+        }
+        Self { inner }
+    }
+
+    /// 清空查询串并返回新 URL。
+    ///
+    /// 原 URL 不会被修改；片段标识会保留。
+    #[must_use]
+    pub fn clear_query(&self) -> Self {
+        let mut inner = self.inner.clone();
+        inner.set_query(None);
+        Self { inner }
     }
 }
 
@@ -469,6 +513,24 @@ mod tests {
         })?;
 
         assert_eq!(output, "q=rust+url&page=2");
+        Ok(())
+    }
+
+    #[test]
+    fn url_query_helpers_return_new_urls() -> std::result::Result<(), Box<dyn StdError>> {
+        let base = parse("https://example.com/search?q=rust#top")?;
+        let one = base.add_query("page", 2);
+        let many = one
+            .add_query("debug", true)
+            .add_queries([("sort", "new"), ("name", "Ada Lovelace")]);
+        let clean = many.clear_query();
+
+        assert_eq!(base.as_str(), "https://example.com/search?q=rust#top");
+        assert_eq!(
+            many.as_str(),
+            "https://example.com/search?q=rust&page=2&debug=true&sort=new&name=Ada+Lovelace#top"
+        );
+        assert_eq!(clean.as_str(), "https://example.com/search#top");
         Ok(())
     }
 

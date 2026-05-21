@@ -50,7 +50,9 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match &self.kind {
-            ErrorKind::Source { .. } | ErrorKind::InvalidRange { .. } => None,
+            ErrorKind::Source { .. }
+            | ErrorKind::InvalidRange { .. }
+            | ErrorKind::InvalidUnsignedRange { .. } => None,
         }
     }
 }
@@ -78,6 +80,17 @@ pub enum ErrorKind {
         min: i64,
         /// 范围上限。
         max: i64,
+    },
+
+    /// 无符号随机数字范围不合法。
+    #[error("random {operation} failed: min `{min}` is greater than max `{max}`")]
+    InvalidUnsignedRange {
+        /// 发生错误的操作名，例如 `uint`。
+        operation: &'static str,
+        /// 范围下限。
+        min: u64,
+        /// 范围上限。
+        max: u64,
     },
 }
 
@@ -111,6 +124,40 @@ pub fn int(min: i64, max: i64) -> Result<i64> {
     let size = (i128::from(max) - i128::from(min) + 1) as u128;
     let offset = sample_u128("int", size)?;
     Ok((i128::from(min) + offset as i128) as i64)
+}
+
+/// 生成闭区间内的随机无符号整数。
+///
+/// `min` 和 `max` 都可能被返回；如果 `min > max`，返回 [`ErrorKind::InvalidUnsignedRange`]。
+pub fn uint(min: u64, max: u64) -> Result<u64> {
+    if min > max {
+        return Err(ErrorKind::InvalidUnsignedRange {
+            operation: "uint",
+            min,
+            max,
+        }
+        .into());
+    }
+
+    let size = u128::from(max) - u128::from(min) + 1;
+    let offset = sample_u128("uint", size)?;
+    Ok((u128::from(min) + offset) as u64)
+}
+
+/// 生成随机延迟值。
+///
+/// 返回闭区间 `[min, max]` 内的随机值。`max <= min` 或系统随机源失败时返回 `min`，适合重试等待
+/// 这类不希望因为随机失败而中断主流程的场景。
+#[must_use]
+pub fn delay(min: u64, max: u64) -> u64 {
+    if max <= min {
+        return min;
+    }
+
+    match uint(min, max) {
+        Ok(value) => value,
+        Err(_) => min,
+    }
 }
 
 /// 从列表中安全随机选择一个元素。
@@ -193,6 +240,16 @@ mod tests {
     }
 
     #[test]
+    fn uint_returns_value_in_inclusive_range() -> std::result::Result<(), Box<dyn StdError>> {
+        assert_eq!(uint(7, 7)?, 7);
+        for _ in 0..32 {
+            let value = uint(2, 5)?;
+            assert!((2..=5).contains(&value));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn invalid_range_returns_error() -> std::result::Result<(), Box<dyn StdError>> {
         let error = match int(10, 1) {
             Ok(value) => return Err(format!("expected range error, got {value}").into()),
@@ -212,6 +269,38 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn invalid_uint_range_returns_error() -> std::result::Result<(), Box<dyn StdError>> {
+        let error = match uint(10, 1) {
+            Ok(value) => return Err(format!("expected range error, got {value}").into()),
+            Err(error) => error,
+        };
+
+        match error.kind() {
+            ErrorKind::InvalidUnsignedRange {
+                operation,
+                min,
+                max,
+            } => {
+                assert_eq!(*operation, "uint");
+                assert_eq!((*min, *max), (10, 1));
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn delay_returns_safe_value_without_errors() {
+        assert_eq!(delay(7, 7), 7);
+        assert_eq!(delay(10, 1), 10);
+        for _ in 0..32 {
+            let value = delay(2, 5);
+            assert!((2..=5).contains(&value));
+        }
     }
 
     #[test]

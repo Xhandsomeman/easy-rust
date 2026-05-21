@@ -30,7 +30,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub struct Error {
     kind: Box<ErrorKind>,
-    source: Option<Box<dyn StdError + 'static>>,
+    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
 }
 
 impl Error {
@@ -41,7 +41,7 @@ impl Error {
         }
     }
 
-    fn with_source(kind: ErrorKind, source: impl StdError + 'static) -> Self {
+    fn with_source(kind: ErrorKind, source: impl StdError + Send + Sync + 'static) -> Self {
         Self {
             kind: Box::new(kind),
             source: Some(Box::new(source)),
@@ -75,7 +75,9 @@ impl fmt::Display for Error {
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source.as_deref()
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn StdError + 'static))
     }
 }
 
