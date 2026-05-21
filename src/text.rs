@@ -84,6 +84,7 @@ pub fn clean(text: impl AsRef<str>) -> String {
 ///
 /// 会去掉标签、解码常见 HTML 特殊字符写法，并使用 [`clean`] 清理连续空白。适合从网页片段中
 /// 提取简单正文，不做 JavaScript 渲染或复杂排版还原。
+#[cfg(feature = "text-html")]
 #[must_use]
 pub fn html_to_text(html: impl AsRef<str>) -> String {
     let fragment = scraper_crate::Html::parse_fragment(html.as_ref());
@@ -167,6 +168,19 @@ pub fn blank_or(text: impl AsRef<str>, default: impl ToString) -> String {
     }
 }
 
+/// 空白文本转成 `None`。
+///
+/// 会先去掉首尾空白；空字符串或纯空白返回 `None`，否则返回去掉首尾空白后的文本。
+#[must_use]
+pub fn none_if_blank(text: impl AsRef<str>) -> Option<String> {
+    let value = text.as_ref().trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
 /// 把字节数格式化成易读文本。
 ///
 /// 使用 1024 进制单位，常见输出如 `512 B`、`1 KB`、`1.5 KB`、`2 MB`。适合日志、
@@ -226,6 +240,124 @@ pub fn format_money(cents: i64) -> String {
     } else {
         format!("{grouped}.{fraction:02}")
     }
+}
+
+/// 从中间截断长文本。
+///
+/// 保留开头 `head` 个字符和结尾 `tail` 个字符，中间用 `...` 连接。原文本不超过保留长度时
+/// 原样返回，按 Unicode 字符计数，不会截断到 UTF-8 字节中间。
+#[must_use]
+pub fn truncate_middle(text: impl AsRef<str>, head: usize, tail: usize) -> String {
+    let text = text.as_ref();
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= head.saturating_add(tail) {
+        return text.to_owned();
+    }
+
+    let mut output = String::new();
+    output.extend(chars.iter().take(head));
+    output.push_str("...");
+    if tail > 0 {
+        output.extend(chars.iter().skip(chars.len() - tail));
+    }
+    output
+}
+
+/// 按常见分隔符拆关键词。
+///
+/// 会按空白字符和 `separators` 中出现的任一字符拆分，自动去掉每个关键词首尾空白，并跳过空项。
+/// 返回顺序保持输入顺序，不做去重或大小写转换。
+#[must_use]
+pub fn split_keywords(text: impl AsRef<str>, separators: impl AsRef<str>) -> Vec<String> {
+    let separators = separators.as_ref();
+    text.as_ref()
+        .split(|character: char| character.is_whitespace() || separators.contains(character))
+        .filter_map(none_if_blank)
+        .collect()
+}
+
+/// 生成适合写入 CSV 单元格的普通文本。
+///
+/// 会把换行、制表符和其它控制字符压成普通空格，再用 [`clean`] 清理连续空白，最后按字符数量
+/// 截断到 `max_chars`。CSV 引号和逗号转义仍交给 CSV 写入函数处理。
+#[must_use]
+pub fn csv_text(text: impl AsRef<str>, max_chars: usize) -> String {
+    let normalized: String = text
+        .as_ref()
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    truncate(clean(normalized), max_chars)
+}
+
+/// 裁剪小数字符串末尾多余的 `0`。
+///
+/// `scale` 表示最多保留的小数位数；不会四舍五入，只按文本裁剪。输入不是小数时返回清理首尾空白
+/// 后的原文本。
+#[must_use]
+pub fn trim_decimal(text: impl AsRef<str>, scale: usize) -> String {
+    let text = text.as_ref().trim();
+    let Some((whole, fraction)) = text.split_once('.') else {
+        return text.to_owned();
+    };
+
+    let whole = if whole.is_empty() || whole == "-" {
+        format!("{whole}0")
+    } else {
+        whole.to_owned()
+    };
+    let fraction: String = fraction.chars().take(scale).collect();
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        whole
+    } else {
+        format!("{whole}.{fraction}")
+    }
+}
+
+/// 格式化百分比。
+///
+/// `value / total * 100` 后按 `scale` 保留最多小数位，并去掉末尾多余的 `0`。`total == 0`
+/// 时返回 `0%`。
+#[must_use]
+pub fn format_percent(value: u64, total: u64, scale: usize) -> String {
+    if total == 0 {
+        return "0%".to_owned();
+    }
+
+    let percent = (value as f64) * 100.0 / (total as f64);
+    let text = format!("{percent:.scale$}");
+    format!("{}%", trim_decimal(text, scale))
+}
+
+/// 遮罩敏感文本。
+///
+/// 保留开头 `head` 个字符和结尾 `tail` 个字符，中间使用 `***`。文本太短无法同时保留两端时，
+/// 返回同长度的 `*`。
+#[must_use]
+pub fn mask(text: impl AsRef<str>, head: usize, tail: usize) -> String {
+    let text = text.as_ref();
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    if chars.len() <= head.saturating_add(tail) {
+        return "*".repeat(chars.len());
+    }
+
+    let mut output = String::new();
+    output.extend(chars.iter().take(head));
+    output.push_str("***");
+    if tail > 0 {
+        output.extend(chars.iter().skip(chars.len() - tail));
+    }
+    output
 }
 
 /// 提取两个标记之间的第一段文本。
@@ -458,6 +590,7 @@ mod tests {
         assert_eq!(clean("  hello \n  world\t "), "hello world");
     }
 
+    #[cfg(feature = "text-html")]
     #[test]
     fn html_to_text_removes_tags_and_decodes_html_text() {
         let html =
@@ -495,6 +628,8 @@ mod tests {
         assert_eq!(blank_or("", "N/A"), "N/A");
         assert_eq!(blank_or(" \n ", "N/A"), "N/A");
         assert_eq!(blank_or("Ada", "N/A"), "Ada");
+        assert_eq!(none_if_blank(" \n "), None);
+        assert_eq!(none_if_blank(" Ada "), Some("Ada".to_owned()));
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024), "1 KB");
         assert_eq!(format_bytes(1536), "1.5 KB");
@@ -502,6 +637,30 @@ mod tests {
         assert_eq!(format_money(0), "0.00");
         assert_eq!(format_money(123_456), "1,234.56");
         assert_eq!(format_money(-123_456), "-1,234.56");
+        assert_eq!(trim_decimal("12.3400", 4), "12.34");
+        assert_eq!(trim_decimal(".5000", 2), "0.5");
+        assert_eq!(format_percent(1, 3, 2), "33.33%");
+        assert_eq!(format_percent(1, 0, 2), "0%");
+        assert_eq!(mask("13800138000", 3, 4), "138***8000");
+        assert_eq!(mask("abc", 2, 2), "***");
+    }
+
+    #[test]
+    fn middle_truncate_keywords_and_csv_text_are_readable() {
+        assert_eq!(
+            truncate_middle("abcdefghijklmnopqrstuvwxyz", 4, 3),
+            "abcd...xyz"
+        );
+        assert_eq!(truncate_middle("你好世界 Rust", 2, 4), "你好...Rust");
+        assert_eq!(
+            split_keywords(" rust, easy;工具|库  wasm ", ",;|"),
+            vec!["rust", "easy", "工具", "库", "wasm"]
+        );
+        assert_eq!(
+            csv_text("hello\n\tworld\u{0000}  rust", 20),
+            "hello world rust"
+        );
+        assert_eq!(csv_text("你好世界", 2), "你好");
     }
 
     #[test]

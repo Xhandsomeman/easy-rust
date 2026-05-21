@@ -1,9 +1,45 @@
 //! easy-rust 常用导入集合。
 
-pub use crate::{
-    cache, cmd, codec, compress, config, crawler, crypto, csv, data, fs, json, log, random, regex,
-    system, text, time, url, uuid,
-};
+#[cfg(feature = "cache")]
+pub use crate::cache;
+#[cfg(feature = "cmd")]
+pub use crate::cmd;
+#[cfg(feature = "codec")]
+pub use crate::codec;
+#[cfg(feature = "compress")]
+pub use crate::compress;
+#[cfg(feature = "config")]
+pub use crate::config;
+#[cfg(feature = "crawler")]
+pub use crate::crawler;
+#[cfg(feature = "crypto")]
+pub use crate::crypto;
+#[cfg(feature = "csv")]
+pub use crate::csv;
+#[cfg(feature = "data")]
+pub use crate::data;
+#[cfg(feature = "fs")]
+pub use crate::fs;
+#[cfg(feature = "json")]
+pub use crate::json;
+#[cfg(feature = "log")]
+pub use crate::log;
+#[cfg(feature = "random")]
+pub use crate::random;
+#[cfg(feature = "regex")]
+pub use crate::regex;
+#[cfg(feature = "request")]
+pub use crate::request;
+#[cfg(feature = "system")]
+pub use crate::system;
+#[cfg(feature = "text")]
+pub use crate::text;
+#[cfg(any(feature = "time", feature = "time-lite"))]
+pub use crate::time;
+#[cfg(feature = "url")]
+pub use crate::url;
+#[cfg(feature = "uuid")]
+pub use crate::uuid;
 
 #[cfg(feature = "sqlite")]
 pub use crate::sqlite;

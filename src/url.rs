@@ -158,6 +158,34 @@ impl Url {
         self.inner.host_str()
     }
 
+    /// 返回 URL 用户名。
+    ///
+    /// 没有用户名时返回空字符串。需要检查是否带密码时，使用 [`Url::has_password`]。
+    #[must_use]
+    pub fn username(&self) -> &str {
+        self.inner.username()
+    }
+
+    /// 判断 URL 是否包含密码。
+    #[must_use]
+    pub fn has_password(&self) -> bool {
+        self.inner.password().is_some()
+    }
+
+    /// 判断 URL 协议是否是 `http` 或 `https`。
+    #[must_use]
+    pub fn is_http_or_https(&self) -> bool {
+        matches!(self.scheme(), "http" | "https")
+    }
+
+    /// 判断 host 是否是 localhost、本地地址、私有地址或保留地址。
+    ///
+    /// 这个方法只检查 URL 字面量里的 host，不做 DNS 解析。
+    #[must_use]
+    pub fn is_local_host(&self) -> bool {
+        self.host().is_some_and(is_local_host_text)
+    }
+
     /// 返回路径部分。
     #[must_use]
     pub fn path(&self) -> &str {
@@ -425,18 +453,24 @@ fn check_safe_inner(input: &str, url: &url_crate::Url) -> Result<()> {
     let Some(host) = url.host_str() else {
         return Err(unsafe_error(input, "host is required"));
     };
-    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") {
-        return Err(unsafe_error(input, "localhost is not allowed"));
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        check_safe_ip(input, ip)?;
+    if is_local_host_text(host) {
+        return Err(unsafe_error(
+            input,
+            "local, private or reserved host is not allowed",
+        ));
     }
 
     Ok(())
 }
 
-fn check_safe_ip(input: &str, ip: IpAddr) -> Result<()> {
+fn is_local_host_text(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.parse::<IpAddr>().is_ok_and(is_local_ip)
+}
+
+fn is_local_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let octets = ip.octets();
@@ -452,12 +486,7 @@ fn check_safe_ip(input: &str, ip: IpAddr) -> Result<()> {
                 || (octets[0] == 198 && matches!(octets[1], 18 | 19))
                 || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
                 || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
-            if private || local || reserved {
-                return Err(unsafe_error(
-                    input,
-                    "local, private or reserved IP is not allowed",
-                ));
-            }
+            private || local || reserved
         }
         IpAddr::V6(ip) => {
             let segments = ip.segments();
@@ -473,25 +502,19 @@ fn check_safe_ip(input: &str, ip: IpAddr) -> Result<()> {
                 && segments[3] == 0
                 && segments[4] == 0
                 && segments[5] == 0xffff;
-            if local || reserved {
-                return Err(unsafe_error(
-                    input,
-                    "local, private or reserved IP is not allowed",
-                ));
-            }
-            if mapped_v4 {
-                let octets = [
-                    (segments[6] >> 8) as u8,
-                    segments[6] as u8,
-                    (segments[7] >> 8) as u8,
-                    segments[7] as u8,
-                ];
-                check_safe_ip(input, IpAddr::from(octets))?;
-            }
+            local
+                || reserved
+                || (mapped_v4 && {
+                    let octets = [
+                        (segments[6] >> 8) as u8,
+                        segments[6] as u8,
+                        (segments[7] >> 8) as u8,
+                        segments[7] as u8,
+                    ];
+                    is_local_ip(IpAddr::from(octets))
+                })
         }
     }
-
-    Ok(())
 }
 
 fn unsafe_error(input: &str, message: &str) -> Error {
@@ -565,6 +588,10 @@ mod tests {
         );
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host(), Some("example.com"));
+        assert_eq!(url.username(), "");
+        assert!(!url.has_password());
+        assert!(url.is_http_or_https());
+        assert!(!url.is_local_host());
         assert_eq!(url.port(), Some(8443));
         assert_eq!(url.path(), "/api/users");
         assert_eq!(url.query_string(), Some("q=rust"));
@@ -676,6 +703,10 @@ mod tests {
         assert!(!is_safe("http://127.0.0.1"));
         assert!(!is_safe("http://192.168.1.1"));
         assert!(!is_safe("http://[::1]"));
+        assert!(parse("http://localhost")?.is_local_host());
+        assert!(parse("http://192.168.1.1")?.is_local_host());
+        assert!(parse("https://user:pass@example.com")?.has_password());
+        assert_eq!(parse("https://user:pass@example.com")?.username(), "user");
         Ok(())
     }
 

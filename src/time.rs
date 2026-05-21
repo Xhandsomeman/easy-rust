@@ -3,14 +3,20 @@
 //! 这个模块提供脚本和后端最常用的时间能力：当前时间、今天日期、Unix 时间戳、
 //! 格式化、解析和同步 sleep。底层时间库只作为内部实现，不作为主路径暴露给用户。
 
-use std::{error::Error as StdError, fmt, thread, time::Duration};
+use std::{error::Error as StdError, fmt, time::Duration};
 
+#[cfg(feature = "time")]
+use std::thread;
+
+#[cfg(feature = "time")]
 use chrono::{
     DateTime as ChronoDateTime, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone,
     format::{Item, StrftimeItems},
 };
 
+#[cfg(feature = "time")]
 const DEFAULT_DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+#[cfg(feature = "time")]
 const DEFAULT_DATE_FORMAT: &str = "%Y-%m-%d";
 
 /// time 模块统一使用的结果类型。
@@ -34,6 +40,7 @@ impl Error {
         Self { kind, source: None }
     }
 
+    #[cfg(feature = "time")]
     fn with_source(kind: ErrorKind, source: impl StdError + Send + Sync + 'static) -> Self {
         Self {
             kind,
@@ -110,11 +117,13 @@ pub enum ErrorKind {
 /// easy-rust 的高层日期时间对象。
 ///
 /// 这个类型表示本地时区下的某一刻。它只暴露脚本和后端常用方法，不暴露底层时间库类型。
+#[cfg(feature = "time")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DateTime {
     inner: ChronoDateTime<Local>,
 }
 
+#[cfg(feature = "time")]
 impl DateTime {
     /// 返回当前日期时间对应的 Unix 时间戳秒数。
     #[must_use]
@@ -140,6 +149,7 @@ impl DateTime {
     }
 }
 
+#[cfg(feature = "time")]
 impl fmt::Display for DateTime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.inner.format(DEFAULT_DATETIME_FORMAT))
@@ -149,11 +159,13 @@ impl fmt::Display for DateTime {
 /// easy-rust 的高层日期对象。
 ///
 /// 这个类型表示本地日期，不包含时分秒。需要完整日期时间时，使用 [`now`] 或 [`parse`]。
+#[cfg(feature = "time")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Date {
     inner: NaiveDate,
 }
 
+#[cfg(feature = "time")]
 impl Date {
     /// 按格式字符串输出日期。
     ///
@@ -165,6 +177,7 @@ impl Date {
     }
 }
 
+#[cfg(feature = "time")]
 impl fmt::Display for Date {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.inner.format(DEFAULT_DATE_FORMAT))
@@ -172,6 +185,7 @@ impl fmt::Display for Date {
 }
 
 /// 返回当前本地日期时间。
+#[cfg(feature = "time")]
 #[must_use]
 pub fn now() -> DateTime {
     DateTime {
@@ -180,6 +194,7 @@ pub fn now() -> DateTime {
 }
 
 /// 返回今天的本地日期。
+#[cfg(feature = "time")]
 #[must_use]
 pub fn today() -> Date {
     Date {
@@ -188,6 +203,7 @@ pub fn today() -> Date {
 }
 
 /// 返回当前 Unix 时间戳秒数。
+#[cfg(feature = "time")]
 #[must_use]
 pub fn unix_time() -> i64 {
     Local::now().timestamp()
@@ -197,6 +213,7 @@ pub fn unix_time() -> i64 {
 ///
 /// 这是 [`DateTime::format`] 的函数式入口，适合 `time::format(time::now(), "...")?`
 /// 这种脚本式写法。
+#[cfg(feature = "time")]
 pub fn format(value: DateTime, pattern: impl AsRef<str>) -> Result<String> {
     value.format(pattern)
 }
@@ -204,6 +221,7 @@ pub fn format(value: DateTime, pattern: impl AsRef<str>) -> Result<String> {
 /// 按格式字符串解析本地日期时间。
 ///
 /// 优先解析完整日期时间；如果格式只包含日期，会把时间部分设为 `00:00:00`。
+#[cfg(feature = "time")]
 pub fn parse(text: impl AsRef<str>, pattern: impl AsRef<str>) -> Result<DateTime> {
     let text = text.as_ref();
     let pattern = pattern.as_ref();
@@ -236,6 +254,7 @@ pub fn parse(text: impl AsRef<str>, pattern: impl AsRef<str>) -> Result<DateTime
 /// 同步睡眠指定秒数。
 ///
 /// 这个函数适合脚本和简单后端工具。异步代码中应继续使用运行时自己的 sleep。
+#[cfg(feature = "time")]
 pub fn sleep_seconds(seconds: u64) {
     thread::sleep(Duration::from_secs(seconds));
 }
@@ -243,6 +262,7 @@ pub fn sleep_seconds(seconds: u64) {
 /// 异步睡眠指定毫秒数。
 ///
 /// 这个函数适合 Tokio 异步代码，调用时使用 `time::sleep_ms_async(100).await`。
+#[cfg(feature = "time")]
 pub async fn sleep_ms_async(ms: u64) {
     tokio::time::sleep(Duration::from_millis(ms)).await;
 }
@@ -250,6 +270,7 @@ pub async fn sleep_ms_async(ms: u64) {
 /// 异步睡眠指定秒数。
 ///
 /// 这个函数适合 Tokio 异步代码，调用时使用 `time::sleep_secs_async(1).await`。
+#[cfg(feature = "time")]
 pub async fn sleep_secs_async(seconds: u64) {
     tokio::time::sleep(Duration::from_secs(seconds)).await;
 }
@@ -321,6 +342,15 @@ pub fn format_duration(duration: Duration) -> String {
     parts.join(" ")
 }
 
+/// 把秒数格式化成易读文本。
+///
+/// 这是 [`format_duration`] 的整数秒入口，适合后台展示耗时或任务运行时间。
+#[must_use]
+pub fn format_duration_secs(seconds: u64) -> String {
+    format_duration(Duration::from_secs(seconds))
+}
+
+#[cfg(feature = "time")]
 fn format_inner(
     value: &ChronoDateTime<Local>,
     pattern: &str,
@@ -330,6 +360,7 @@ fn format_inner(
     Ok(value.format(pattern).to_string())
 }
 
+#[cfg(feature = "time")]
 fn validate_pattern(operation: &'static str, pattern: &str) -> Result<()> {
     let invalid = StrftimeItems::new(pattern).any(|item| matches!(item, Item::Error));
 
@@ -344,6 +375,7 @@ fn validate_pattern(operation: &'static str, pattern: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "time")]
 fn ambiguous_error(text: &str, pattern: &str) -> Error {
     ErrorKind::Ambiguous {
         text: text.to_owned(),
@@ -354,11 +386,13 @@ fn ambiguous_error(text: &str, pattern: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "time")]
     use std::error::Error as StdError;
 
     use super::*;
 
     #[test]
+    #[cfg(feature = "time")]
     fn now_and_unix_time_return_current_timestamp() {
         let before = unix_time();
         let current = now();
@@ -370,6 +404,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "time")]
     fn today_formats_date() -> std::result::Result<(), Box<dyn StdError>> {
         let text = today().format("%Y-%m-%d")?;
 
@@ -380,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "time")]
     fn parse_and_format_datetime() -> std::result::Result<(), Box<dyn StdError>> {
         let value = parse("2026-05-19 12:34:56", "%Y-%m-%d %H:%M:%S")?;
         let text = format(value.clone(), "%Y-%m-%d %H:%M:%S")?;
@@ -390,6 +426,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "time")]
     fn parse_date_only_defaults_to_midnight() -> std::result::Result<(), Box<dyn StdError>> {
         let value = parse("2026-05-19", "%Y-%m-%d")?;
 
@@ -399,6 +436,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "time")]
     fn invalid_format_returns_format_error() -> std::result::Result<(), Box<dyn StdError>> {
         let error = match now().format("%Q") {
             Ok(_) => return Err("expected format error".into()),
@@ -417,6 +455,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "time")]
     fn invalid_parse_returns_parse_error() -> std::result::Result<(), Box<dyn StdError>> {
         let error = match parse("not a time", "%Y-%m-%d %H:%M:%S") {
             Ok(_) => return Err("expected parse error".into()),
@@ -435,10 +474,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "time")]
     fn sleep_zero_seconds_returns() {
         sleep_seconds(0);
     }
 
+    #[cfg(feature = "time")]
     #[tokio::test]
     async fn async_sleep_helpers_return() {
         sleep_ms_async(0).await;
@@ -465,6 +506,7 @@ mod tests {
         assert_eq!(format_duration(millis(250)), "250ms");
         assert_eq!(format_duration(millis(1500)), "1s 500ms");
         assert_eq!(format_duration(seconds(65)), "1m 5s");
+        assert_eq!(format_duration_secs(65), "1m 5s");
         assert_eq!(format_duration(hours(25) + minutes(3)), "1d 1h");
     }
 }

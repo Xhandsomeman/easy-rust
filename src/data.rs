@@ -13,6 +13,8 @@ use std::{
     str::FromStr,
 };
 
+use crate::json::{self, Value};
+
 /// data 模块统一使用的结果类型。
 ///
 /// 成功时返回 `T`，失败时返回 [`Error`]。当前主要用于 [`chunked`] 处理无效分块大小。
@@ -220,6 +222,38 @@ impl Form {
             .collect()
     }
 
+    /// 把字段读取成文本列表。
+    ///
+    /// 重复字段会全部参与拆分；单个字段里可以用逗号、分号、竖线或空白分隔。
+    #[must_use]
+    pub fn list(&self, name: impl AsRef<str>) -> Vec<String> {
+        self.values(name).into_iter().flat_map(parse_list).collect()
+    }
+
+    /// 把字段读取成 JSON 动态值。
+    ///
+    /// 字段缺失、空白或 JSON 不合法时返回 `None`。
+    #[must_use]
+    pub fn json(&self, name: impl AsRef<str>) -> Option<Value> {
+        self.text(name).and_then(parse_json)
+    }
+
+    /// 把字段读取成 JSON object 或 array。
+    ///
+    /// 字段缺失、空白、JSON 不合法或根不是 object/array 时返回 `None`。
+    #[must_use]
+    pub fn json_collection(&self, name: impl AsRef<str>) -> Option<Value> {
+        self.text(name).and_then(parse_json_collection)
+    }
+
+    /// 把字段读取成键值条目列表。
+    ///
+    /// 字段值支持 `key=value` 或 `key: value`，多项可用换行、逗号或分号分隔。
+    #[must_use]
+    pub fn key_values(&self, name: impl AsRef<str>) -> Vec<KeyValue> {
+        self.text(name).map_or_else(Vec::new, parse_key_values)
+    }
+
     fn parse_value<T>(&self, operation: &'static str, name: &str) -> Result<Option<T>>
     where
         T: FromStr,
@@ -248,6 +282,17 @@ impl Form {
             .find(|value| !value.trim().is_empty())
             .map(String::as_str)
     }
+}
+
+/// 简单键值条目。
+///
+/// 使用 [`parse_key_values`] 创建，适合运行时表单、配置中心或导入字段中的 `key=value` 文本。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyValue {
+    /// 键名。
+    pub key: String,
+    /// 值文本。
+    pub value: String,
 }
 
 impl<T> Counter<T>
@@ -355,6 +400,94 @@ where
             .push(value.to_string());
     }
     form
+}
+
+/// 把文本解析成布尔值。
+///
+/// 支持 `true/false`、`1/0`、`yes/no`、`on/off`，大小写不敏感；空白或未知值返回 `None`。
+#[must_use]
+pub fn parse_bool(text: impl AsRef<str>) -> Option<bool> {
+    match text.as_ref().trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// 把文本解析成数字或其它实现 [`FromStr`] 的类型。
+///
+/// 空白或转换失败时返回 `None`。
+#[must_use]
+pub fn parse_number<T>(text: impl AsRef<str>) -> Option<T>
+where
+    T: FromStr,
+{
+    text.as_ref().trim().parse().ok()
+}
+
+/// 把文本解析成可选字符串。
+///
+/// 空字符串或纯空白返回 `None`；其它文本返回去掉首尾空白后的字符串。
+#[must_use]
+pub fn parse_text(text: impl AsRef<str>) -> Option<String> {
+    let text = text.as_ref().trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+/// 把文本解析成字符串列表。
+///
+/// 会按逗号、分号、竖线和空白拆分，自动去掉空项，不做去重。
+#[must_use]
+pub fn parse_list(text: impl AsRef<str>) -> Vec<String> {
+    text.as_ref()
+        .split(|character: char| character.is_whitespace() || matches!(character, ',' | ';' | '|'))
+        .filter_map(parse_text)
+        .collect()
+}
+
+/// 把文本解析成 JSON 动态值。
+///
+/// 空白或 JSON 不合法时返回 `None`。
+#[must_use]
+pub fn parse_json(text: impl AsRef<str>) -> Option<Value> {
+    parse_text(text).and_then(|text| json::value_from_str(text).ok())
+}
+
+/// 把文本解析成 JSON object 或 array。
+///
+/// 根不是 object 或 array 时返回 `None`。
+#[must_use]
+pub fn parse_json_collection(text: impl AsRef<str>) -> Option<Value> {
+    match parse_json(text)? {
+        value @ (Value::Array(_) | Value::Object(_)) => Some(value),
+        _ => None,
+    }
+}
+
+/// 把文本解析成键值条目列表。
+///
+/// 支持 `key=value` 和 `key: value`；多项可用换行、逗号或分号分隔。空 key 会被跳过。
+#[must_use]
+pub fn parse_key_values(text: impl AsRef<str>) -> Vec<KeyValue> {
+    text.as_ref()
+        .split(['\n', '\r', ',', ';'])
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            let (key, value) = entry.split_once('=').or_else(|| entry.split_once(':'))?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some(KeyValue {
+                key: key.to_owned(),
+                value: value.trim().to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// 对每个元素执行映射，并立即返回列表。
@@ -521,6 +654,9 @@ mod tests {
             ("tag", "rust"),
             ("tag", "easy"),
             ("blank", "  "),
+            ("items", "a,b c|d"),
+            ("meta", r#"{"ok":true}"#),
+            ("entries", "a=1\nb: 2"),
         ]);
 
         assert_eq!(form.text("name"), Some("Ada".to_owned()));
@@ -532,7 +668,63 @@ mod tests {
             form.values("tag"),
             vec!["rust".to_owned(), "easy".to_owned()]
         );
+        assert_eq!(form.list("items"), vec!["a", "b", "c", "d"]);
+        assert_eq!(
+            form.json("meta")
+                .and_then(|value| value.get("ok").and_then(Value::as_bool)),
+            Some(true)
+        );
+        assert_eq!(
+            form.json_collection("meta")
+                .and_then(|value| value.get("ok").and_then(Value::as_bool)),
+            Some(true)
+        );
+        assert_eq!(
+            form.key_values("entries"),
+            vec![
+                KeyValue {
+                    key: "a".to_owned(),
+                    value: "1".to_owned(),
+                },
+                KeyValue {
+                    key: "b".to_owned(),
+                    value: "2".to_owned(),
+                },
+            ]
+        );
         Ok(())
+    }
+
+    #[test]
+    fn parse_helpers_cover_runtime_field_values() {
+        assert_eq!(parse_bool("YES"), Some(true));
+        assert_eq!(parse_bool("off"), Some(false));
+        assert_eq!(parse_bool("maybe"), None);
+        assert_eq!(parse_number::<u32>("42"), Some(42));
+        assert_eq!(parse_number::<u32>("bad"), None);
+        assert_eq!(parse_text("  Ada  "), Some("Ada".to_owned()));
+        assert_eq!(parse_text(" \n "), None);
+        assert_eq!(parse_list("a,b c|d"), vec!["a", "b", "c", "d"]);
+        assert_eq!(
+            parse_json(r#"{"ok":true}"#).and_then(|value| value.get("ok").and_then(Value::as_bool)),
+            Some(true)
+        );
+        assert!(parse_json("{bad json").is_none());
+        assert!(parse_json_collection(r#"[1,2]"#).is_some());
+        assert!(parse_json_collection("123").is_none());
+        assert_eq!(
+            parse_key_values("a=1\nb: 2, =skip"),
+            vec![
+                KeyValue {
+                    key: "a".to_owned(),
+                    value: "1".to_owned(),
+                },
+                KeyValue {
+                    key: "b".to_owned(),
+                    value: "2".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

@@ -192,12 +192,20 @@ pub fn sha256(input: impl AsRef<[u8]>) -> String {
     hex(sha256_bytes(input))
 }
 
+/// 计算 SHA-256 固定数组摘要。
+///
+/// 适合链上地址生成、二进制协议和固定长度校验，避免调用方再检查 `Vec<u8>` 长度。
+#[must_use]
+pub fn sha256_array(input: impl AsRef<[u8]>) -> [u8; 32] {
+    Sha256::digest(input.as_ref()).into()
+}
+
 /// 计算 SHA-256 原始字节摘要。
 ///
 /// 适合链上地址生成、二进制协议拼接等不希望先转成十六进制字符串的场景。
 #[must_use]
 pub fn sha256_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
-    Sha256::digest(input.as_ref()).to_vec()
+    sha256_array(input).to_vec()
 }
 
 /// 计算 SHA-512 十六进制摘要。
@@ -206,10 +214,16 @@ pub fn sha512(input: impl AsRef<[u8]>) -> String {
     hex(sha512_bytes(input))
 }
 
+/// 计算 SHA-512 固定数组摘要。
+#[must_use]
+pub fn sha512_array(input: impl AsRef<[u8]>) -> [u8; 64] {
+    Sha512::digest(input.as_ref()).into()
+}
+
 /// 计算 SHA-512 原始字节摘要。
 #[must_use]
 pub fn sha512_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
-    Sha512::digest(input.as_ref()).to_vec()
+    sha512_array(input).to_vec()
 }
 
 /// 读取文件并计算 SHA-256 十六进制摘要。
@@ -290,12 +304,20 @@ pub fn keccak256(input: impl AsRef<[u8]>) -> String {
     hex(keccak256_bytes(input))
 }
 
+/// 计算 Keccak-256 固定数组摘要。
+///
+/// 这是以太坊等链上场景常用的 Keccak，不是 NIST SHA3-256。
+#[must_use]
+pub fn keccak256_array(input: impl AsRef<[u8]>) -> [u8; 32] {
+    Keccak256::digest(input.as_ref()).into()
+}
+
 /// 计算 Keccak-256 原始字节摘要。
 ///
 /// 这是以太坊等链上场景常用的 Keccak，不是 NIST SHA3-256。
 #[must_use]
 pub fn keccak256_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
-    Keccak256::digest(input.as_ref()).to_vec()
+    keccak256_array(input).to_vec()
 }
 
 /// 计算 RIPEMD-160 十六进制摘要。
@@ -304,10 +326,16 @@ pub fn ripemd160(input: impl AsRef<[u8]>) -> String {
     hex(ripemd160_bytes(input))
 }
 
+/// 计算 RIPEMD-160 固定数组摘要。
+#[must_use]
+pub fn ripemd160_array(input: impl AsRef<[u8]>) -> [u8; 20] {
+    Ripemd160::digest(input.as_ref()).into()
+}
+
 /// 计算 RIPEMD-160 原始字节摘要。
 #[must_use]
 pub fn ripemd160_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
-    Ripemd160::digest(input.as_ref()).to_vec()
+    ripemd160_array(input).to_vec()
 }
 
 /// 计算 Bitcoin 风格 HASH160：RIPEMD160(SHA256(data))。
@@ -316,10 +344,16 @@ pub fn hash160(input: impl AsRef<[u8]>) -> String {
     hex(hash160_bytes(input))
 }
 
+/// 计算 Bitcoin 风格 HASH160 固定数组：RIPEMD160(SHA256(data))。
+#[must_use]
+pub fn hash160_array(input: impl AsRef<[u8]>) -> [u8; 20] {
+    ripemd160_array(sha256_array(input))
+}
+
 /// 计算 Bitcoin 风格 HASH160 原始字节：RIPEMD160(SHA256(data))。
 #[must_use]
 pub fn hash160_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
-    ripemd160_bytes(sha256_bytes(input))
+    hash160_array(input).to_vec()
 }
 
 /// 生成安全密码哈希字符串。
@@ -571,6 +605,8 @@ mod tests {
             hex(sha256_bytes("abc")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        assert_eq!(sha256_array("abc").len(), 32);
+        assert_eq!(sha256_array("abc").to_vec(), sha256_bytes("abc"));
         assert_eq!(sha256_bytes("abc").len(), 32);
         assert_eq!(
             sha512("abc"),
@@ -578,6 +614,8 @@ mod tests {
              2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
                 .replace(' ', "")
         );
+        assert_eq!(sha512_array("abc").len(), 64);
+        assert_eq!(sha512_array("abc").to_vec(), sha512_bytes("abc"));
         assert_eq!(sha512_bytes("abc").len(), 64);
     }
 
@@ -617,16 +655,21 @@ mod tests {
             hex(keccak256_bytes("")),
             "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
         );
+        assert_eq!(keccak256_array("").to_vec(), keccak256_bytes(""));
         assert_eq!(ripemd160(""), "9c1185a5c5e9fc54612808977ee8f548b2258d31");
         assert_eq!(
             hex(ripemd160_bytes("")),
             "9c1185a5c5e9fc54612808977ee8f548b2258d31"
         );
+        assert_eq!(ripemd160_array("").len(), 20);
+        assert_eq!(ripemd160_array("").to_vec(), ripemd160_bytes(""));
         assert_eq!(hash160(""), "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb");
         assert_eq!(
             hex(hash160_bytes("")),
             "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb"
         );
+        assert_eq!(hash160_array("").len(), 20);
+        assert_eq!(hash160_array("").to_vec(), hash160_bytes(""));
         assert_eq!(hash160_bytes("").len(), 20);
     }
 

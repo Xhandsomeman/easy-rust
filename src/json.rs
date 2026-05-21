@@ -223,6 +223,37 @@ pub fn value_from_bytes_or(bytes: impl AsRef<[u8]>, default: Value) -> Value {
     }
 }
 
+/// 把 JSON 文本解析成动态值，失败时返回 `null`。
+///
+/// 适合弱结构字段兜底展示。需要错误信息时请使用 [`value_from_str`]。
+#[must_use]
+pub fn value_or_null(text: impl AsRef<str>) -> Value {
+    value_from_str_or(text, Value::Null)
+}
+
+/// 把 JSON 文本格式化成 pretty JSON，失败时返回原文本。
+///
+/// 适合后台展示 JSON 字段。这个函数不会接受非标准 JSON；解析失败时不修改原文本。
+#[must_use]
+pub fn pretty_or_original(text: impl AsRef<str>) -> String {
+    let text = text.as_ref();
+    match value_from_str(text).and_then(|value| to_string_pretty(&value)) {
+        Ok(output) => output,
+        Err(_) => text.to_owned(),
+    }
+}
+
+/// 把 JSON 文本解析成 object，失败或根不是 object 时返回空 object。
+///
+/// 适合运行时扩展字段兜底。需要区分错误原因时请使用 [`value_from_str`] 后自行检查形状。
+#[must_use]
+pub fn object_or_empty(text: impl AsRef<str>) -> Value {
+    match value_from_str(text) {
+        Ok(Value::Object(object)) => Value::Object(object),
+        _ => value!({}),
+    }
+}
+
 /// 把 Rust 值序列化成紧凑 JSON 字符串。
 ///
 /// 这个函数默认不加多余空格和换行，适合网络传输、存储和日志。需要人类可读输出时，使用
@@ -372,6 +403,17 @@ mod tests {
         assert_eq!(fallback.name, "Fallback");
         assert_eq!(value["ok"], false);
         assert_eq!(bytes["ok"], true);
+    }
+
+    #[test]
+    fn display_or_helpers_keep_safe_fallbacks() {
+        assert_eq!(value_or_null("{bad json"), Value::Null);
+        assert_eq!(value_or_null(r#"{"ok":true}"#)["ok"], true);
+        assert_eq!(pretty_or_original("{bad json"), "{bad json");
+        assert!(pretty_or_original(r#"{"ok":true}"#).contains('\n'));
+        assert_eq!(object_or_empty("{bad json"), value!({}));
+        assert_eq!(object_or_empty(r#"[1,2]"#), value!({}));
+        assert_eq!(object_or_empty(r#"{"ok":true}"#)["ok"], true);
     }
 
     #[test]

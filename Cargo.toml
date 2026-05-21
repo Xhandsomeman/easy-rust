@@ -1,51 +1,126 @@
 [package]
 name = "easy-rust"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 rust-version = "1.94"
 description = "Python-like ergonomics for production-grade Rust."
 license = "MIT OR Apache-2.0"
 
 [features]
-default = []
-sqlite = ["dep:rusqlite"]
+default = ["native"]
+native = [
+    "cache",
+    "cmd",
+    "codec",
+    "compress",
+    "config",
+    "crawler",
+    "crypto",
+    "csv",
+    "data",
+    "fs",
+    "json",
+    "log",
+    "random",
+    "regex",
+    "request",
+    "system",
+    "text-html",
+    "time",
+    "url",
+    "uuid",
+]
+full = ["native", "sqlite"]
+wasm = ["text", "json", "codec", "data", "url", "regex", "time-lite"]
+cache = ["dep:thiserror"]
+cmd = ["dep:thiserror", "fs"]
+codec = ["dep:thiserror", "dep:base64_crate", "dep:bs58"]
+compress = ["dep:thiserror", "dep:flate2", "dep:tar_crate", "dep:zip_crate", "fs"]
+config = ["dep:thiserror", "dep:serde", "dep:serde_json", "dep:toml", "dep:yaml_serde", "fs"]
+crawler = ["dep:thiserror", "dep:scraper_crate", "dep:url_crate", "request"]
+crypto = [
+    "dep:thiserror",
+    "dep:aes-gcm",
+    "dep:argon2",
+    "dep:ed25519-dalek",
+    "dep:getrandom",
+    "dep:hmac",
+    "dep:k256",
+    "dep:ripemd",
+    "dep:sha2",
+    "dep:sha3",
+    "dep:subtle",
+    "fs",
+]
+csv = ["dep:thiserror", "dep:csv_crate", "dep:serde", "fs"]
+data = ["dep:thiserror", "json"]
+fs = ["dep:thiserror", "dep:getrandom", "dep:serde", "dep:serde_json"]
+json = ["dep:thiserror", "dep:serde", "dep:serde_json"]
+log = ["dep:thiserror", "dep:chrono", "fs"]
+random = ["dep:thiserror", "dep:getrandom"]
+regex = ["dep:thiserror", "dep:regex_crate"]
+request = [
+    "dep:thiserror",
+    "dep:base64_crate",
+    "dep:bytes",
+    "dep:encoding_rs",
+    "dep:http",
+    "dep:httpdate",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:serde_urlencoded",
+    "dep:tokio",
+    "dep:url_crate",
+    "fs",
+    "json",
+    "time",
+]
+sqlite = ["dep:thiserror", "dep:rusqlite", "fs"]
+system = ["dep:thiserror", "dep:hostname", "fs"]
+text = ["dep:thiserror"]
+text-html = ["text", "dep:scraper_crate"]
+time-lite = ["dep:thiserror"]
+time = ["time-lite", "dep:chrono", "dep:tokio"]
+url = ["dep:thiserror", "dep:serde", "dep:serde_urlencoded", "dep:url_crate"]
+uuid = ["dep:thiserror", "dep:uuid_crate"]
 
 [dependencies]
-aes-gcm = "0.10"
-argon2 = "0.5"
-base64_crate = { package = "base64", version = "0.22" }
-bs58 = "0.5"
-bytes = "1.11.1"
-chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
-csv_crate = { package = "csv", version = "1" }
-ed25519-dalek = "2"
-encoding_rs = "0.8.35"
-flate2 = "1"
-getrandom = "0.3.4"
-hmac = "0.13"
-hostname = "0.4"
-http = "1.4.0"
-httpdate = "1.0.3"
-k256 = { version = "0.13", features = ["ecdsa"] }
-reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "charset", "http2", "system-proxy", "gzip", "brotli", "zstd", "deflate", "cookies", "query", "form", "multipart", "blocking"] }
-regex_crate = { package = "regex", version = "1" }
-ripemd = "0.2"
+aes-gcm = { version = "0.10", optional = true }
+argon2 = { version = "0.5", optional = true }
+base64_crate = { package = "base64", version = "0.22", optional = true }
+bs58 = { version = "0.5", optional = true }
+bytes = { version = "1.11.1", optional = true }
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"], optional = true }
+csv_crate = { package = "csv", version = "1", optional = true }
+ed25519-dalek = { version = "2", optional = true }
+encoding_rs = { version = "0.8.35", optional = true }
+flate2 = { version = "1", optional = true }
+getrandom = { version = "0.3.4", optional = true }
+hmac = { version = "0.13", optional = true }
+hostname = { version = "0.4", optional = true }
+http = { version = "1.4.0", optional = true }
+httpdate = { version = "1.0.3", optional = true }
+k256 = { version = "0.13", features = ["ecdsa"], optional = true }
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "charset", "http2", "system-proxy", "gzip", "brotli", "zstd", "deflate", "cookies", "query", "form", "multipart", "blocking"], optional = true }
+regex_crate = { package = "regex", version = "1", optional = true }
+ripemd = { version = "0.2", optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
-scraper_crate = { package = "scraper", version = "0.27" }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-serde_urlencoded = "0.7.1"
-sha2 = "0.11.0"
-sha3 = "0.12"
-subtle = "2"
-tar_crate = { package = "tar", version = "0.4.46" }
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "net"] }
-toml = "1.1"
-url_crate = { package = "url", version = "2.5.8" }
-uuid_crate = { package = "uuid", version = "1.23.1", features = ["v4"] }
-yaml_serde = "0.10"
-zip_crate = { package = "zip", version = "6.0.0", default-features = false, features = ["deflate"] }
+scraper_crate = { package = "scraper", version = "0.27", optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.149", optional = true }
+serde_urlencoded = { version = "0.7.1", optional = true }
+sha2 = { version = "0.11.0", optional = true }
+sha3 = { version = "0.12", optional = true }
+subtle = { version = "2", optional = true }
+tar_crate = { package = "tar", version = "0.4.46", optional = true }
+thiserror = { version = "2.0.18", optional = true }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "net"], optional = true }
+toml = { version = "1.1", optional = true }
+url_crate = { package = "url", version = "2.5.8", optional = true }
+uuid_crate = { package = "uuid", version = "1.23.1", features = ["v4"], optional = true }
+yaml_serde = { version = "0.10", optional = true }
+zip_crate = { package = "zip", version = "6.0.0", default-features = false, features = ["deflate"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time"] }
