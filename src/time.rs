@@ -246,6 +246,30 @@ pub fn seconds(seconds: u64) -> Duration {
     Duration::from_secs(seconds)
 }
 
+/// 创建毫秒级时间长度。
+///
+/// 适合需要比秒更细的超时、等待或测试场景。
+#[must_use]
+pub fn millis(millis: u64) -> Duration {
+    Duration::from_millis(millis)
+}
+
+/// 创建分钟级时间长度。
+///
+/// 内部使用饱和乘法，极大输入会饱和到 `u64::MAX` 秒，避免溢出 panic。
+#[must_use]
+pub fn minutes(minutes: u64) -> Duration {
+    Duration::from_secs(minutes.saturating_mul(60))
+}
+
+/// 创建小时级时间长度。
+///
+/// 内部使用饱和乘法，极大输入会饱和到 `u64::MAX` 秒，避免溢出 panic。
+#[must_use]
+pub fn hours(hours: u64) -> Duration {
+    Duration::from_secs(hours.saturating_mul(60).saturating_mul(60))
+}
+
 fn format_inner(
     value: &ChronoDateTime<Local>,
     pattern: &str,
@@ -367,5 +391,14 @@ mod tests {
     #[test]
     fn seconds_returns_duration() {
         assert_eq!(seconds(60), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn simple_duration_helpers_return_expected_values() {
+        assert_eq!(millis(250), Duration::from_millis(250));
+        assert_eq!(minutes(2), Duration::from_secs(120));
+        assert_eq!(hours(2), Duration::from_secs(7200));
+        assert_eq!(minutes(u64::MAX), Duration::from_secs(u64::MAX));
+        assert_eq!(hours(u64::MAX), Duration::from_secs(u64::MAX));
     }
 }

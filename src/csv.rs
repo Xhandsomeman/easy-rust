@@ -3,7 +3,7 @@
 //! 这个模块提供像 Python 一样直接读写 CSV 文件的高层入口。默认 CSV 带 header，
 //! 强类型读写使用 serde，动态行读写使用 [`Row`]。
 
-use std::{collections::HashSet, error::Error as StdError, fmt, fs as std_fs};
+use std::{collections::HashSet, error::Error as StdError, fmt, fs as std_fs, io};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -243,6 +243,37 @@ where
     Ok(())
 }
 
+/// 追加结构体行到带 header 的 CSV 文件。
+///
+/// 文件不存在或为空时会写入 header；已有内容时只追加数据行，不重复写 header。
+pub fn append<T>(path: impl Into<FsPath>, rows: &[T]) -> Result<()>
+where
+    T: Serialize,
+{
+    let path = path.into();
+    create_parent_dirs(&path)?;
+    let has_content = file_has_content(&path)?;
+    let file = std_fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.as_std_path())
+        .map_err(|source| write_error(&path, source.into()))?;
+    let mut writer = csv_crate::WriterBuilder::new()
+        .has_headers(!has_content)
+        .from_writer(file);
+
+    for row in rows {
+        writer
+            .serialize(row)
+            .map_err(|source| write_error(&path, source))?;
+    }
+
+    writer
+        .flush()
+        .map_err(|source| write_error(&path, source.into()))?;
+    Ok(())
+}
+
 /// 读取带 header 的 CSV 文件为动态行。
 ///
 /// 所有字段值都会按字符串保存。重复 header 会返回 [`ErrorKind::Shape`]，避免动态行读取时
@@ -313,6 +344,90 @@ pub fn write_rows(path: impl Into<FsPath>, rows: &[Row]) -> Result<()> {
     writer
         .flush()
         .map_err(|source| write_error(&path, source.into()))?;
+    Ok(())
+}
+
+/// 追加动态行到带 header 的 CSV 文件。
+///
+/// 文件不存在或为空时会根据追加行写入 header；已有内容时沿用现有 header。行里出现现有
+/// header 之外的新字段会返回 [`ErrorKind::Shape`]，避免静默丢列。
+pub fn append_rows(path: impl Into<FsPath>, rows: &[Row]) -> Result<()> {
+    let path = path.into();
+    create_parent_dirs(&path)?;
+    let has_content = file_has_content(&path)?;
+    let headers = if has_content {
+        let headers = read_existing_headers(&path)?;
+        validate_rows_fit_headers(&path, &headers, rows)?;
+        headers
+    } else {
+        collect_headers(rows)
+    };
+
+    let file = std_fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.as_std_path())
+        .map_err(|source| write_error(&path, source.into()))?;
+    let mut writer = csv_crate::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(file);
+
+    if !has_content && !headers.is_empty() {
+        writer
+            .write_record(&headers)
+            .map_err(|source| write_error(&path, source))?;
+    }
+
+    for row in rows {
+        let record: Vec<&str> = headers
+            .iter()
+            .map(|header| row.get(header).unwrap_or(""))
+            .collect();
+        writer
+            .write_record(record)
+            .map_err(|source| write_error(&path, source))?;
+    }
+
+    writer
+        .flush()
+        .map_err(|source| write_error(&path, source.into()))?;
+    Ok(())
+}
+
+fn file_has_content(path: &FsPath) -> Result<bool> {
+    match std_fs::metadata(path.as_std_path()) {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(write_error(path, source.into())),
+    }
+}
+
+fn read_existing_headers(path: &FsPath) -> Result<Vec<String>> {
+    let mut reader = csv_crate::ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(path.as_std_path())
+        .map_err(|source| read_error(path, source))?;
+    let headers = reader
+        .headers()
+        .map_err(|source| read_error(path, source))?
+        .clone();
+    validate_unique_headers(path, &headers)?;
+    Ok(headers.iter().map(ToOwned::to_owned).collect())
+}
+
+fn validate_rows_fit_headers(path: &FsPath, headers: &[String], rows: &[Row]) -> Result<()> {
+    for row in rows {
+        for field in row.headers() {
+            if !headers.iter().any(|header| header == field) {
+                return Err(ErrorKind::Shape {
+                    operation: "append_rows",
+                    path: path.clone(),
+                    message: format!("字段 `{field}` 不在已有 header 中"),
+                }
+                .into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -512,6 +627,72 @@ mod tests {
         write_rows(path_text(&path), &[])?;
 
         assert_eq!(test_fs::read_to_string(path)?, "");
+        Ok(())
+    }
+
+    #[test]
+    fn append_struct_rows_writes_header_only_for_new_file()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("append")?;
+        let path = root.join("out/users.csv");
+
+        append(
+            path_text(&path),
+            &[User {
+                id: 1,
+                name: "Ada".to_owned(),
+            }],
+        )?;
+        append(
+            path_text(&path),
+            &[User {
+                id: 2,
+                name: "Grace".to_owned(),
+            }],
+        )?;
+
+        assert_eq!(test_fs::read_to_string(path)?, "id,name\n1,Ada\n2,Grace\n");
+        Ok(())
+    }
+
+    #[test]
+    fn append_rows_uses_existing_headers_and_rejects_new_fields()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("append-rows")?;
+        let path = root.join("out/users.csv");
+
+        append_rows(
+            path_text(&path),
+            &[Row::from_pairs([("name", "Ada"), ("age", "36")])],
+        )?;
+        append_rows(path_text(&path), &[Row::from_pairs([("name", "Grace")])])?;
+
+        assert_eq!(
+            test_fs::read_to_string(&path)?,
+            "name,age\nAda,36\nGrace,\n"
+        );
+
+        let error = match append_rows(
+            path_text(&path),
+            &[Row::from_pairs([("name", "Lin"), ("city", "Shanghai")])],
+        ) {
+            Ok(()) => return Err("expected append_rows shape error".into()),
+            Err(error) => error,
+        };
+
+        match error.kind() {
+            ErrorKind::Shape {
+                operation, message, ..
+            } => {
+                assert_eq!(*operation, "append_rows");
+                assert!(message.contains("city"));
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+
+        let empty = root.join("out/empty.csv");
+        append_rows(path_text(&empty), &[])?;
+        assert_eq!(test_fs::read_to_string(empty)?, "");
         Ok(())
     }
 

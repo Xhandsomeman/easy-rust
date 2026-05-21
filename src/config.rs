@@ -1,8 +1,8 @@
 //! 极简配置 API。
 //!
-//! 这个模块把 `.env`、真实环境变量和 JSON 配置文件合并成一个入口。单个 key 用
-//! [`get`]、[`get_or`] 和 [`require`]；完整结构体配置用 [`load`] 和 [`auto`]。调用方不需要
-//! 手动管理配置来源。
+//! 这个模块把 `.env`、真实环境变量和 JSON/TOML/YAML 配置文件合并成一个入口。单个 key 用
+//! [`get`]、[`get_or`] 和 [`require`]；完整结构体配置用 [`load`]、[`load_toml`]、
+//! [`load_yaml`] 和 [`auto`]。调用方不需要手动管理配置来源。
 
 use std::{
     collections::BTreeMap, env, error::Error as StdError, fmt, fs as std_fs, io,
@@ -115,6 +115,24 @@ pub enum ErrorKind {
         path: String,
     },
 
+    /// TOML 配置解析失败。
+    #[error("config {operation} toml_decode `{path}` failed")]
+    TomlDecode {
+        /// 发生错误的操作名，例如 `load_toml`。
+        operation: &'static str,
+        /// 发生错误的路径。
+        path: String,
+    },
+
+    /// YAML 配置解析失败。
+    #[error("config {operation} yaml_decode `{path}` failed")]
+    YamlDecode {
+        /// 发生错误的操作名，例如 `load_yaml`。
+        operation: &'static str,
+        /// 发生错误的路径。
+        path: String,
+    },
+
     /// `.env` 文件格式错误。
     #[error("config dotenv_parse `{path}` line {line} failed: {message}")]
     DotenvParse {
@@ -195,6 +213,45 @@ where
     load_from_sources(
         "load",
         Some(path.as_std_path()),
+        ConfigFormat::Json,
+        true,
+        StdPath::new(DEFAULT_DOTENV_PATH),
+        real_env_values(),
+    )
+}
+
+/// 读取 TOML 配置文件，并用 `.env` 和真实环境变量覆盖。
+///
+/// TOML 文件必须存在，且根必须是 object。覆盖顺序固定为：TOML 文件最低，当前目录 `.env`
+/// 覆盖 TOML，真实环境变量最高。
+pub fn load_toml<T>(path: impl Into<FsPath>) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let path = path.into();
+    load_from_sources(
+        "load_toml",
+        Some(path.as_std_path()),
+        ConfigFormat::Toml,
+        true,
+        StdPath::new(DEFAULT_DOTENV_PATH),
+        real_env_values(),
+    )
+}
+
+/// 读取 YAML 配置文件，并用 `.env` 和真实环境变量覆盖。
+///
+/// YAML 文件必须存在，且根必须是 object。覆盖顺序固定为：YAML 文件最低，当前目录 `.env`
+/// 覆盖 YAML，真实环境变量最高。
+pub fn load_yaml<T>(path: impl Into<FsPath>) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let path = path.into();
+    load_from_sources(
+        "load_yaml",
+        Some(path.as_std_path()),
+        ConfigFormat::Yaml,
         true,
         StdPath::new(DEFAULT_DOTENV_PATH),
         real_env_values(),
@@ -205,6 +262,8 @@ where
 ///
 /// 这个函数会读取可选 `.env`、可选 `config.json` 和真实环境变量；没有 `config.json` 也可以
 /// 只靠环境变量启动。覆盖顺序固定为：`config.json` 最低，`.env` 覆盖文件，真实环境变量最高。
+/// 它不会自动搜索 `config.toml` 或 `config.yaml`，需要这些格式时请显式调用 [`load_toml`] 或
+/// [`load_yaml`]。
 pub fn auto<T>() -> Result<T>
 where
     T: DeserializeOwned,
@@ -212,10 +271,28 @@ where
     load_from_sources(
         "auto",
         Some(StdPath::new(DEFAULT_CONFIG_PATH)),
+        ConfigFormat::Json,
         false,
         StdPath::new(DEFAULT_DOTENV_PATH),
         real_env_values(),
     )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConfigFormat {
+    Json,
+    Toml,
+    Yaml,
+}
+
+impl ConfigFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Json => "JSON",
+            Self::Toml => "TOML",
+            Self::Yaml => "YAML",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -259,7 +336,14 @@ fn get_from_sources_with_config<T>(
 where
     T: DeserializeOwned,
 {
-    let object = load_object_from_sources("get", config_path, false, dotenv_path, real_env)?;
+    let object = load_object_from_sources(
+        "get",
+        config_path,
+        ConfigFormat::Json,
+        false,
+        dotenv_path,
+        real_env,
+    )?;
     let field = field_name_from_env_key(key);
     object
         .get(&field)
@@ -298,6 +382,7 @@ where
 fn load_from_sources<T>(
     operation: &'static str,
     config_path: Option<&StdPath>,
+    config_format: ConfigFormat,
     config_required: bool,
     dotenv_path: &StdPath,
     real_env: impl IntoIterator<Item = (String, String)>,
@@ -308,6 +393,7 @@ where
     let object = load_object_from_sources(
         operation,
         config_path,
+        config_format,
         config_required,
         dotenv_path,
         real_env,
@@ -325,12 +411,13 @@ where
 fn load_object_from_sources(
     operation: &'static str,
     config_path: Option<&StdPath>,
+    config_format: ConfigFormat,
     config_required: bool,
     dotenv_path: &StdPath,
     real_env: impl IntoIterator<Item = (String, String)>,
 ) -> Result<Map<String, Value>> {
     let mut object = match config_path {
-        Some(path) => read_json_object(operation, path, config_required)?,
+        Some(path) => read_config_object(operation, config_format, path, config_required)?,
         None => Map::new(),
     };
 
@@ -352,8 +439,9 @@ where
     })
 }
 
-fn read_json_object(
+fn read_config_object(
     operation: &'static str,
+    format: ConfigFormat,
     path: &StdPath,
     required: bool,
 ) -> Result<Map<String, Value>> {
@@ -371,17 +459,51 @@ fn read_json_object(
         }
     };
 
-    let value: Value = serde_json::from_str(&text).map_err(|source| {
-        Error::with_source(ErrorKind::JsonDecode { path: path_display }, source)
-    })?;
+    let value = decode_config_value(operation, format, &path_display, &text)?;
 
     match value {
         Value::Object(object) => Ok(object),
         _ => Err(ErrorKind::Shape {
             operation,
-            message: "JSON 配置根必须是 object".to_owned(),
+            message: format!("{} 配置根必须是 object", format.label()),
         }
         .into()),
+    }
+}
+
+fn decode_config_value(
+    operation: &'static str,
+    format: ConfigFormat,
+    path: &str,
+    text: &str,
+) -> Result<Value> {
+    match format {
+        ConfigFormat::Json => serde_json::from_str(text).map_err(|source| {
+            Error::with_source(
+                ErrorKind::JsonDecode {
+                    path: path.to_owned(),
+                },
+                source,
+            )
+        }),
+        ConfigFormat::Toml => toml::from_str(text).map_err(|source| {
+            Error::with_source(
+                ErrorKind::TomlDecode {
+                    operation,
+                    path: path.to_owned(),
+                },
+                source,
+            )
+        }),
+        ConfigFormat::Yaml => yaml_serde::from_str(text).map_err(|source| {
+            Error::with_source(
+                ErrorKind::YamlDecode {
+                    operation,
+                    path: path.to_owned(),
+                },
+                source,
+            )
+        }),
     }
 }
 
@@ -657,6 +779,7 @@ mod tests {
         let app: AppConfig = load_from_sources(
             "load",
             Some(&config),
+            ConfigFormat::Json,
             true,
             &dotenv,
             [
@@ -686,6 +809,7 @@ mod tests {
         let app: AppConfig = load_from_sources(
             "auto",
             Some(&config),
+            ConfigFormat::Json,
             false,
             &dotenv,
             [("DEBUG".to_owned(), "true".to_owned())],
@@ -733,7 +857,14 @@ mod tests {
         let dotenv = root.join(".env");
         std_fs::write(&config, "[1,2,3]")?;
 
-        let error = match load_from_sources::<AppConfig>("load", Some(&config), true, &dotenv, []) {
+        let error = match load_from_sources::<AppConfig>(
+            "load",
+            Some(&config),
+            ConfigFormat::Json,
+            true,
+            &dotenv,
+            [],
+        ) {
             Ok(_) => return Err("expected shape error".into()),
             Err(error) => error,
         };
@@ -743,6 +874,148 @@ mod tests {
             other => return Err(format!("unexpected error: {other}").into()),
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn load_toml_merges_dotenv_and_real_env() -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("load-toml")?;
+        let config = root.join("config.toml");
+        let dotenv = root.join(".env");
+        std_fs::write(&config, "host = 'file'\nport = 7000\ndebug = false\n")?;
+        std_fs::write(&dotenv, "PORT=8000\n")?;
+
+        let app: AppConfig = load_from_sources(
+            "load_toml",
+            Some(&config),
+            ConfigFormat::Toml,
+            true,
+            &dotenv,
+            [
+                ("HOST".to_owned(), "env".to_owned()),
+                ("DEBUG".to_owned(), "true".to_owned()),
+            ],
+        )?;
+
+        assert_eq!(
+            app,
+            AppConfig {
+                host: "env".to_owned(),
+                port: 8000,
+                debug: true,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_yaml_merges_dotenv_and_real_env() -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("load-yaml")?;
+        let config = root.join("config.yaml");
+        let dotenv = root.join(".env");
+        std_fs::write(&config, "host: file\nport: 7000\ndebug: false\n")?;
+        std_fs::write(&dotenv, "PORT=8000\n")?;
+
+        let app: AppConfig = load_from_sources(
+            "load_yaml",
+            Some(&config),
+            ConfigFormat::Yaml,
+            true,
+            &dotenv,
+            [
+                ("HOST".to_owned(), "env".to_owned()),
+                ("DEBUG".to_owned(), "true".to_owned()),
+            ],
+        )?;
+
+        assert_eq!(
+            app,
+            AppConfig {
+                host: "env".to_owned(),
+                port: 8000,
+                debug: true,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn toml_and_yaml_errors_include_operation_and_path()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("format-errors")?;
+        let dotenv = root.join(".env");
+        let bad_toml = root.join("bad.toml");
+        let bad_yaml = root.join("bad.yaml");
+        let yaml_list = root.join("list.yaml");
+        let missing = root.join("missing.toml");
+        std_fs::write(&bad_toml, "host = ")?;
+        std_fs::write(&bad_yaml, "host: [")?;
+        std_fs::write(&yaml_list, "- 1\n- 2\n")?;
+
+        let toml_error = match load_from_sources::<AppConfig>(
+            "load_toml",
+            Some(&bad_toml),
+            ConfigFormat::Toml,
+            true,
+            &dotenv,
+            [],
+        ) {
+            Ok(_) => return Err("expected toml error".into()),
+            Err(error) => error,
+        };
+        assert!(toml_error.to_string().contains("load_toml"));
+        assert!(toml_error.to_string().contains("bad.toml"));
+        assert!(matches!(toml_error.kind(), ErrorKind::TomlDecode { .. }));
+        assert!(toml_error.source().is_some());
+
+        let yaml_error = match load_from_sources::<AppConfig>(
+            "load_yaml",
+            Some(&bad_yaml),
+            ConfigFormat::Yaml,
+            true,
+            &dotenv,
+            [],
+        ) {
+            Ok(_) => return Err("expected yaml error".into()),
+            Err(error) => error,
+        };
+        assert!(yaml_error.to_string().contains("load_yaml"));
+        assert!(yaml_error.to_string().contains("bad.yaml"));
+        assert!(matches!(yaml_error.kind(), ErrorKind::YamlDecode { .. }));
+        assert!(yaml_error.source().is_some());
+
+        let shape_error = match load_from_sources::<AppConfig>(
+            "load_yaml",
+            Some(&yaml_list),
+            ConfigFormat::Yaml,
+            true,
+            &dotenv,
+            [],
+        ) {
+            Ok(_) => return Err("expected yaml shape error".into()),
+            Err(error) => error,
+        };
+        match shape_error.kind() {
+            ErrorKind::Shape { operation, message } => {
+                assert_eq!(*operation, "load_yaml");
+                assert!(message.contains("YAML"));
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+
+        let read_error = match load_from_sources::<AppConfig>(
+            "load_toml",
+            Some(&missing),
+            ConfigFormat::Toml,
+            true,
+            &dotenv,
+            [],
+        ) {
+            Ok(_) => return Err("expected missing file error".into()),
+            Err(error) => error,
+        };
+        assert!(read_error.to_string().contains("missing.toml"));
+        assert!(matches!(read_error.kind(), ErrorKind::Read { .. }));
         Ok(())
     }
 }

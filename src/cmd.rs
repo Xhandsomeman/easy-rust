@@ -4,10 +4,15 @@
 //! 返回错误，需要显式调用 [`Output::raise_for_status`] 才把退出状态转换成错误。
 
 use std::{
+    any::type_name,
+    collections::HashMap,
+    env,
     error::Error as StdError,
     fmt,
+    io::Write,
     path::PathBuf,
-    process::{Command, ExitStatus},
+    process::{Command, ExitStatus, Stdio},
+    str::FromStr,
     thread,
     time::{Duration, Instant},
 };
@@ -29,18 +34,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// [`Error::kind`]。
 #[derive(Debug)]
 pub struct Error {
-    kind: ErrorKind,
+    kind: Box<ErrorKind>,
     source: Option<Box<dyn StdError + 'static>>,
 }
 
 impl Error {
     fn new(kind: ErrorKind) -> Self {
-        Self { kind, source: None }
+        Self {
+            kind: Box::new(kind),
+            source: None,
+        }
     }
 
     fn with_source(kind: ErrorKind, source: impl StdError + 'static) -> Self {
         Self {
-            kind,
+            kind: Box::new(kind),
             source: Some(Box::new(source)),
         }
     }
@@ -122,6 +130,52 @@ pub enum ErrorKind {
         /// 超时时长，单位毫秒。
         timeout_ms: u128,
     },
+
+    /// 写入命令标准输入失败。
+    #[error("cmd {operation} stdin `{command}` failed with {size} bytes")]
+    Stdin {
+        /// 发生错误的操作名，例如 `exec_input`。
+        operation: &'static str,
+        /// 调用方执行的命令。
+        command: String,
+        /// 输入字节数。
+        size: usize,
+    },
+
+    /// 命令行参数语法解析失败。
+    #[error("cmd {operation} args `{input}` failed: {message}")]
+    ArgSyntax {
+        /// 发生错误的操作名，例如 `parse_args`。
+        operation: &'static str,
+        /// 发生错误的参数文本。
+        input: String,
+        /// 面向人的错误说明。
+        message: String,
+    },
+
+    /// 必填命令行参数不存在。
+    #[error("cmd {operation} arg `{key}` is required")]
+    ArgRequired {
+        /// 发生错误的操作名，例如 `require_arg`。
+        operation: &'static str,
+        /// 缺失的参数名。
+        key: String,
+    },
+
+    /// 命令行参数类型转换失败。
+    #[error("cmd {operation} arg `{key}` value `{value}` failed: expected {expected}: {message}")]
+    ArgType {
+        /// 发生错误的操作名，例如 `arg`。
+        operation: &'static str,
+        /// 发生错误的参数名。
+        key: String,
+        /// 发生错误的参数值。
+        value: String,
+        /// 期望的 Rust 类型名。
+        expected: &'static str,
+        /// 面向人的错误说明。
+        message: String,
+    },
 }
 
 /// 命令执行结果。
@@ -195,6 +249,257 @@ impl Output {
         }
         .into())
     }
+}
+
+/// 当前程序的命令行参数集合。
+///
+/// 这个类型由 [`parse_args`] 返回，适合测试或手动传入参数列表。普通程序通常直接使用
+/// [`arg`]、[`arg_or`]、[`require_arg`]、[`flag`] 和 [`args`] 这些短入口。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Args {
+    options: HashMap<String, Vec<Option<String>>>,
+    positionals: Vec<String>,
+}
+
+impl Args {
+    /// 读取一个可选命令行参数。
+    ///
+    /// 参数不存在或只有 flag 没有值时返回 `Ok(None)`；值存在但不能转换为目标类型时返回
+    /// [`ErrorKind::ArgType`]。重复参数会读取最后一个有值的参数。
+    pub fn arg<T>(&self, name: impl AsRef<str>) -> Result<Option<T>>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        self.parse_value("arg", name.as_ref())
+    }
+
+    /// 读取命令行参数，不存在时使用默认值。
+    ///
+    /// 适合端口号、配置路径这类有默认值的启动参数。
+    pub fn arg_or<T>(&self, name: impl AsRef<str>, default: T) -> Result<T>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        Ok(self
+            .parse_value("arg_or", name.as_ref())?
+            .unwrap_or(default))
+    }
+
+    /// 读取必填命令行参数。
+    ///
+    /// 参数不存在或只有 flag 没有值时返回 [`ErrorKind::ArgRequired`]；类型转换失败时返回
+    /// [`ErrorKind::ArgType`]。
+    pub fn require_arg<T>(&self, name: impl AsRef<str>) -> Result<T>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        let key = normalize_arg_key(name.as_ref());
+        self.parse_value("require_arg", name.as_ref())?
+            .ok_or_else(|| {
+                ErrorKind::ArgRequired {
+                    operation: "require_arg",
+                    key,
+                }
+                .into()
+            })
+    }
+
+    /// 判断 flag 是否出现。
+    ///
+    /// `--debug` 会返回 `true`；`--debug=false`、`--debug=0`、`--debug=no` 和 `--debug=off`
+    /// 会返回 `false`。其它带值写法只要参数出现就返回 `true`。
+    #[must_use]
+    pub fn flag(&self, name: impl AsRef<str>) -> bool {
+        let key = normalize_arg_key(name.as_ref());
+        let Some(values) = self.options.get(&key) else {
+            return false;
+        };
+        match values.last() {
+            Some(Some(value)) => match value.to_ascii_lowercase().as_str() {
+                "false" | "0" | "no" | "off" => false,
+                "true" | "1" | "yes" | "on" => true,
+                _ => true,
+            },
+            Some(None) => true,
+            None => false,
+        }
+    }
+
+    /// 返回位置参数。
+    ///
+    /// 位置参数不包含 `--key value` 这类选项；`--` 后面的内容会原样进入这个列表。
+    #[must_use]
+    pub fn args(&self) -> Vec<String> {
+        self.positionals.clone()
+    }
+
+    /// 返回某个参数出现过的所有值。
+    ///
+    /// flag 形式的参数没有值，不会出现在返回列表中。返回顺序保持命令行出现顺序。
+    #[must_use]
+    pub fn values(&self, name: impl AsRef<str>) -> Vec<String> {
+        let key = normalize_arg_key(name.as_ref());
+        self.options
+            .get(&key)
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .filter_map(|value| value.clone())
+            .collect()
+    }
+
+    fn parse_value<T>(&self, operation: &'static str, name: &str) -> Result<Option<T>>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        let key = normalize_arg_key(name);
+        let Some(value) = self
+            .options
+            .get(&key)
+            .and_then(|values| values.iter().rev().find_map(Clone::clone))
+        else {
+            return Ok(None);
+        };
+
+        value.parse::<T>().map(Some).map_err(|source| {
+            ErrorKind::ArgType {
+                operation,
+                key,
+                value,
+                expected: type_name::<T>(),
+                message: source.to_string(),
+            }
+            .into()
+        })
+    }
+}
+
+/// 读取当前程序的可选命令行参数。
+///
+/// 例如启动参数是 `--port 8080` 时，`cmd::arg::<u16>("port")?` 会返回 `Some(8080)`。
+pub fn arg<T>(name: impl AsRef<str>) -> Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    current_args()?.arg(name)
+}
+
+/// 读取当前程序的命令行参数，不存在时使用默认值。
+///
+/// 适合 `cmd::arg_or("port", 8000)?` 这类简单配置。
+pub fn arg_or<T>(name: impl AsRef<str>, default: T) -> Result<T>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    current_args()?.arg_or(name, default)
+}
+
+/// 读取当前程序的必填命令行参数。
+///
+/// 参数不存在或没有值时返回 [`ErrorKind::ArgRequired`]。
+pub fn require_arg<T>(name: impl AsRef<str>) -> Result<T>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    current_args()?.require_arg(name)
+}
+
+/// 判断当前程序的 flag 是否出现。
+///
+/// 适合 `cmd::flag("debug")` 这类开关参数。
+#[must_use]
+pub fn flag(name: impl AsRef<str>) -> bool {
+    current_args().is_ok_and(|args| args.flag(name))
+}
+
+/// 返回当前程序的位置参数。
+///
+/// 位置参数不包含选项和值；`--` 后的内容会原样保留。
+pub fn args() -> Vec<String> {
+    current_args().map_or_else(|_| Vec::new(), |args| args.args())
+}
+
+/// 解析一组命令行参数。
+///
+/// 传入内容应当是不含程序名的参数列表。支持 `--key value`、`--key=value`、`--flag`、
+/// `-k value` 和 `-k=value`；遇到 `--` 后，剩余内容都作为位置参数。
+pub fn parse_args<S>(args: impl IntoIterator<Item = S>) -> Result<Args>
+where
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|value| value.as_ref().to_owned())
+        .collect();
+    let mut output = Args::default();
+    let mut index = 0;
+
+    while index < args.len() {
+        let token = &args[index];
+        if token == "--" {
+            output.positionals.extend(args[index + 1..].iter().cloned());
+            break;
+        }
+
+        if is_option_token(token) {
+            let body = option_body(token);
+            let (key, value) = if let Some((key, value)) = body.split_once('=') {
+                (key, Some(value.to_owned()))
+            } else if args
+                .get(index + 1)
+                .is_some_and(|next| next != "--" && !is_option_token(next))
+            {
+                index += 1;
+                (body, Some(args[index].clone()))
+            } else {
+                (body, None)
+            };
+            let key = normalize_arg_key(key);
+            if key.is_empty() {
+                return Err(ErrorKind::ArgSyntax {
+                    operation: "parse_args",
+                    input: token.clone(),
+                    message: "参数名不能为空".to_owned(),
+                }
+                .into());
+            }
+            output.options.entry(key).or_default().push(value);
+        } else {
+            output.positionals.push(token.clone());
+        }
+
+        index += 1;
+    }
+
+    Ok(output)
+}
+
+fn current_args() -> Result<Args> {
+    parse_args(env::args().skip(1))
+}
+
+fn is_option_token(token: &str) -> bool {
+    (token.starts_with("--") && token.len() > 2) || (token.starts_with('-') && token.len() > 1)
+}
+
+fn option_body(token: &str) -> &str {
+    token
+        .strip_prefix("--")
+        .or_else(|| token.strip_prefix('-'))
+        .unwrap_or(token)
+}
+
+fn normalize_arg_key(key: &str) -> String {
+    key.trim()
+        .trim_start_matches('-')
+        .replace('_', "-")
+        .to_ascii_lowercase()
 }
 
 /// 执行简单命令字符串。
@@ -386,11 +691,58 @@ pub fn shell_timeout(command: impl AsRef<str>, timeout: Duration) -> Result<Outp
     )
 }
 
+/// 带标准输入执行简单命令字符串。
+///
+/// 输入会一次性写入子进程 stdin，输出仍会完整读取到 [`Output`]。非零退出不会自动变成错误。
+pub fn run_input(command: impl AsRef<str>, input: impl AsRef<[u8]>) -> Result<Output> {
+    let command = command.as_ref();
+    let parts = parse_command(command)?;
+    execute(
+        command.trim().to_owned(),
+        &parts[0],
+        &parts[1..],
+        CommandOptions::default().input("run_input", input),
+    )
+}
+
+/// 带标准输入直接执行程序和参数。
+///
+/// 这是安全主路径：程序和参数不经过 shell，输入会一次性写入 stdin。
+pub fn exec_input<A>(
+    program: impl AsRef<str>,
+    args: impl IntoIterator<Item = A>,
+    input: impl AsRef<[u8]>,
+) -> Result<Output>
+where
+    A: AsRef<str>,
+{
+    let program = program.as_ref().to_owned();
+    let args = collect_args(args);
+    let command = format_command(&program, &args);
+    execute(
+        command,
+        &program,
+        &args,
+        CommandOptions::default().input("exec_input", input),
+    )
+}
+
+/// 带标准输入通过系统 shell 执行命令。
+///
+/// 这个函数会启用 shell 语法；不要把未信任的用户输入拼进命令字符串。
+pub fn shell_input(command: impl AsRef<str>, input: impl AsRef<[u8]>) -> Result<Output> {
+    shell_with_options(
+        command.as_ref().to_owned(),
+        CommandOptions::default().input("shell_input", input),
+    )
+}
+
 #[derive(Default)]
 struct CommandOptions {
     dir: Option<PathBuf>,
     env: Vec<(String, String)>,
     timeout: Option<(Duration, &'static str)>,
+    input: Option<(Vec<u8>, &'static str)>,
 }
 
 impl CommandOptions {
@@ -414,6 +766,11 @@ impl CommandOptions {
 
     fn timeout(mut self, operation: &'static str, timeout: Duration) -> Self {
         self.timeout = Some((timeout, operation));
+        self
+    }
+
+    fn input(mut self, operation: &'static str, input: impl AsRef<[u8]>) -> Self {
+        self.input = Some((input.as_ref().to_vec(), operation));
         self
     }
 }
@@ -445,17 +802,19 @@ fn execute(
         process.env(key, value);
     }
 
-    let output = if let Some((timeout, operation)) = options.timeout {
-        output_with_timeout(process, operation, &command, timeout)?
-    } else {
-        process.output().map_err(|source| {
+    let output = match (options.input, options.timeout) {
+        (Some((input, operation)), _) => output_with_input(process, operation, &command, &input)?,
+        (None, Some((timeout, operation))) => {
+            output_with_timeout(process, operation, &command, timeout)?
+        }
+        (None, None) => process.output().map_err(|source| {
             Error::with_source(
                 ErrorKind::Spawn {
                     command: command.clone(),
                 },
                 source,
             )
-        })?
+        })?,
     };
 
     Ok(Output {
@@ -472,6 +831,7 @@ fn output_with_timeout(
     command: &str,
     timeout: Duration,
 ) -> Result<std::process::Output> {
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = process.spawn().map_err(|source| {
         Error::with_source(
             ErrorKind::Spawn {
@@ -521,6 +881,61 @@ fn output_with_timeout(
 
         thread::sleep(WAIT_POLL_INTERVAL);
     }
+}
+
+fn output_with_input(
+    mut process: Command,
+    operation: &'static str,
+    command: &str,
+    input: &[u8],
+) -> Result<std::process::Output> {
+    process
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn().map_err(|source| {
+        Error::with_source(
+            ErrorKind::Spawn {
+                command: command.to_owned(),
+            },
+            source,
+        )
+    })?;
+
+    let write_result = match child.stdin.as_mut() {
+        Some(stdin) => stdin.write_all(input).map_err(|source| {
+            Error::with_source(
+                ErrorKind::Stdin {
+                    operation,
+                    command: command.to_owned(),
+                    size: input.len(),
+                },
+                source,
+            )
+        }),
+        None => Err(ErrorKind::Stdin {
+            operation,
+            command: command.to_owned(),
+            size: input.len(),
+        }
+        .into()),
+    };
+
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    drop(child.stdin.take());
+
+    child.wait_with_output().map_err(|source| {
+        Error::with_source(
+            ErrorKind::Spawn {
+                command: command.to_owned(),
+            },
+            source,
+        )
+    })
 }
 
 fn collect_args<A>(args: impl IntoIterator<Item = A>) -> Vec<String>
@@ -689,6 +1104,86 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn parse_args_reads_common_cli_shapes() -> std::result::Result<(), Box<dyn StdError>> {
+        let args = parse_args([
+            "--port",
+            "8080",
+            "--name=Ada Lovelace",
+            "--debug",
+            "-c=config.toml",
+            "input.txt",
+            "--",
+            "--literal",
+        ])?;
+
+        assert_eq!(args.arg::<u16>("port")?, Some(8080));
+        assert_eq!(args.require_arg::<String>("name")?, "Ada Lovelace");
+        assert!(args.flag("debug"));
+        assert_eq!(args.arg::<String>("c")?, Some("config.toml".to_owned()));
+        assert_eq!(
+            args.args(),
+            vec!["input.txt".to_owned(), "--literal".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_args_normalizes_keys_and_keeps_duplicate_values()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let args = parse_args([
+            "--database-url",
+            "first",
+            "--database_url=second",
+            "--feature=false",
+            "--feature",
+        ])?;
+
+        assert_eq!(
+            args.values("database_url"),
+            vec!["first".to_owned(), "second".to_owned()]
+        );
+        assert_eq!(
+            args.arg::<String>("database_url")?,
+            Some("second".to_owned())
+        );
+        assert!(args.flag("feature"));
+
+        let disabled = parse_args(["--feature=false"])?;
+        assert!(!disabled.flag("feature"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_args_reports_required_and_type_errors() -> std::result::Result<(), Box<dyn StdError>> {
+        let args = parse_args(["--port", "abc"])?;
+        let type_error = match args.arg::<u16>("port") {
+            Ok(value) => return Err(format!("expected type error, got {value:?}").into()),
+            Err(error) => error,
+        };
+        assert!(type_error.to_string().contains("arg"));
+        assert!(type_error.to_string().contains("port"));
+
+        let required_error = match args.require_arg::<String>("config") {
+            Ok(value) => return Err(format!("expected required error, got {value}").into()),
+            Err(error) => error,
+        };
+        match required_error.kind() {
+            ErrorKind::ArgRequired { key, .. } => assert_eq!(key, "config"),
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+
+        let syntax_error = match parse_args(["--=bad"]) {
+            Ok(value) => return Err(format!("expected syntax error, got {value:?}").into()),
+            Err(error) => error,
+        };
+        match syntax_error.kind() {
+            ErrorKind::ArgSyntax { input, .. } => assert_eq!(input, "--=bad"),
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+        Ok(())
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn shell_executes_unix_shell_syntax() -> std::result::Result<(), Box<dyn StdError>> {
@@ -718,6 +1213,22 @@ mod tests {
             ErrorKind::Timeout { operation, .. } => assert_eq!(*operation, "shell_timeout"),
             other => return Err(format!("unexpected error: {other}").into()),
         }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn input_variants_write_stdin_on_unix() -> std::result::Result<(), Box<dyn StdError>> {
+        let run = run_input("cat", "hello")?;
+        let exec = exec_input("cat", [""; 0], "world")?;
+        let shell = shell_input("tr a-z A-Z", "rust")?;
+        let nonzero = shell_input("cat >/dev/null; exit 5", "ignored")?;
+
+        assert_eq!(run.stdout(), "hello");
+        assert_eq!(exec.stdout(), "world");
+        assert_eq!(shell.stdout(), "RUST");
+        assert!(!nonzero.success());
+        assert_eq!(nonzero.status_code(), Some(5));
         Ok(())
     }
 

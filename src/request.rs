@@ -7,7 +7,7 @@
 use std::{
     collections::hash_map::DefaultHasher,
     error::Error as StdError,
-    fmt,
+    fmt, fs as std_fs,
     future::{Future, IntoFuture},
     hash::{Hash, Hasher},
     net::IpAddr,
@@ -20,10 +20,12 @@ use bytes::Bytes;
 use encoding_rs::Encoding;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
-    header::{CONTENT_TYPE, RETRY_AFTER, USER_AGENT},
+    header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER, USER_AGENT},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use url_crate::Url;
+
+use base64_crate::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use crate::fs::Path as FsPath;
 
@@ -151,6 +153,37 @@ pub enum ErrorKind {
         field: String,
         /// 发生错误的文件路径。
         path: FsPath,
+    },
+
+    /// 下载响应体保存失败。
+    #[error("request {operation} `{url}` to `{path}` failed")]
+    Download {
+        /// 发生错误的操作名，例如 `download`。
+        operation: &'static str,
+        /// 下载 URL。
+        url: String,
+        /// 保存路径。
+        path: FsPath,
+    },
+
+    /// 响应体保存失败。
+    #[error("request {operation} `{url}` to `{path}` failed")]
+    Save {
+        /// 发生错误的操作名，例如 `save`。
+        operation: &'static str,
+        /// 响应 URL。
+        url: String,
+        /// 保存路径。
+        path: FsPath,
+    },
+
+    /// 认证请求头构造失败。
+    #[error("request {operation} auth `{scheme}` failed")]
+    Auth {
+        /// 发生错误的操作名，例如 `bearer`。
+        operation: &'static str,
+        /// 认证方案，例如 `Bearer` 或 `Basic`。
+        scheme: &'static str,
     },
 
     /// 请求头名称解析失败。
@@ -334,6 +367,30 @@ impl Request {
         self
     }
 
+    /// 设置 Bearer token 认证。
+    ///
+    /// 这个方法会设置 `Authorization: Bearer ...`。token 包含非法 header 字符时，错误会保存在
+    /// 请求里，并在 `.await?` 时返回。
+    #[must_use]
+    pub fn bearer(mut self, token: impl AsRef<str>) -> Self {
+        self.set_auth("bearer", "Bearer", format!("Bearer {}", token.as_ref()));
+        self
+    }
+
+    /// 设置 Basic 认证。
+    ///
+    /// 这个方法会把 `username:password` 做 Base64 编码，并设置 `Authorization: Basic ...`。
+    #[must_use]
+    pub fn basic(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+        let raw = format!("{}:{}", username.as_ref(), password.as_ref());
+        self.set_auth(
+            "basic",
+            "Basic",
+            format!("Basic {}", BASE64_STANDARD.encode(raw)),
+        );
+        self
+    }
+
     /// 添加 URL 查询参数。
     ///
     /// 参数通过 serde 序列化为 query string。这个方法保持 Python `requests` 的感觉：
@@ -475,6 +532,7 @@ impl Request {
         for header in self.headers {
             request = match header {
                 PendingHeader::Raw(name, value) => request.header(name, value)?,
+                PendingHeader::Parsed(name, value) => request.parsed_header(name, value),
             };
         }
 
@@ -516,6 +574,18 @@ impl Request {
     fn store_error(&mut self, error: Error) {
         if self.pending_error.is_none() {
             self.pending_error = Some(error);
+        }
+    }
+
+    fn set_auth(&mut self, operation: &'static str, scheme: &'static str, value: String) {
+        match HeaderValue::from_str(&value) {
+            Ok(value) => self
+                .headers
+                .push(PendingHeader::Parsed(AUTHORIZATION, value)),
+            Err(source) => self.store_error(Error::with_source(
+                ErrorKind::Auth { operation, scheme },
+                source,
+            )),
         }
     }
 
@@ -705,6 +775,11 @@ impl RequestBuilder {
         let value = parse_header_value(name.as_str(), value.as_ref())?;
         self.headers.insert(name, value);
         Ok(self)
+    }
+
+    fn parsed_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.headers.insert(name, value);
+        self
     }
 
     async fn send(self) -> Result<Response> {
@@ -962,6 +1037,16 @@ impl Response {
         .into())
     }
 
+    /// 把响应体保存到文件。
+    ///
+    /// 这个方法只负责保存已经拿到的响应体，不会检查状态码。需要把 404/500 转成错误时，
+    /// 先调用 [`Response::raise_for_status`]。
+    pub fn save(&self, path: impl Into<FsPath>) -> Result<FsPath> {
+        let path = path.into();
+        save_bytes_to_path("save", self.url.as_str(), &path, &self.body)?;
+        Ok(path)
+    }
+
     async fn from_reqwest(
         method: Method,
         attempts: u32,
@@ -1044,6 +1129,44 @@ pub fn delete(url: impl Into<String>) -> Request {
 /// 适合非标准或扩展 HTTP 方法。
 pub fn request(method: impl ToString, url: impl Into<String>) -> Request {
     Request::new_raw(method, url)
+}
+
+/// 下载 URL 内容到文件。
+///
+/// 这个函数发送 GET 请求，显式检查状态码，并把响应体保存到 `path`。写入会自动创建父目录。
+pub async fn download(url: impl AsRef<str>, path: impl Into<FsPath>) -> Result<FsPath> {
+    let url = url.as_ref().to_owned();
+    let path = path.into();
+    let response = get(&url).await.map_err(|source| {
+        Error::with_source(
+            ErrorKind::Download {
+                operation: "download",
+                url: url.clone(),
+                path: path.clone(),
+            },
+            source,
+        )
+    })?;
+    response.raise_for_status().map_err(|source| {
+        Error::with_source(
+            ErrorKind::Download {
+                operation: "download",
+                url: url.clone(),
+                path: path.clone(),
+            },
+            source,
+        )
+    })?;
+    response.save(&path).map_err(|source| {
+        Error::with_source(
+            ErrorKind::Download {
+                operation: "download",
+                url: url.clone(),
+                path: path.clone(),
+            },
+            source,
+        )
+    })
 }
 
 /// 解析主机名对应的 IP 地址。
@@ -1173,6 +1296,40 @@ impl PendingMethod {
 #[derive(Clone, Debug)]
 enum PendingHeader {
     Raw(String, String),
+    Parsed(HeaderName, HeaderValue),
+}
+
+fn save_bytes_to_path(
+    operation: &'static str,
+    url: &str,
+    path: &FsPath,
+    bytes: &[u8],
+) -> Result<()> {
+    if let Some(parent) = path.as_std_path().parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std_fs::create_dir_all(parent).map_err(|source| {
+            Error::with_source(
+                ErrorKind::Save {
+                    operation,
+                    url: url.to_owned(),
+                    path: path.clone(),
+                },
+                source,
+            )
+        })?;
+    }
+
+    std_fs::write(path.as_std_path(), bytes).map_err(|source| {
+        Error::with_source(
+            ErrorKind::Save {
+                operation,
+                url: url.to_owned(),
+                path: path.clone(),
+            },
+            source,
+        )
+    })
 }
 
 fn parse_header_name(name: &str) -> Result<HeaderName> {
@@ -1471,6 +1628,98 @@ mod tests {
             .await?;
 
         assert_eq!(response.text(), "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_helpers_set_authorization_header()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bearer"))
+            .and(header("authorization", "Bearer token123"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("bearer"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/basic"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("basic"))
+            .mount(&server)
+            .await;
+
+        let bearer = get(format!("{}/bearer", server.uri()))
+            .bearer("token123")
+            .await?;
+        let basic = get(format!("{}/basic", server.uri()))
+            .basic("user", "pass")
+            .await?;
+
+        assert_eq!(bearer.text(), "bearer");
+        assert_eq!(basic.text(), "basic");
+
+        let error = match get(format!("{}/bearer", server.uri()))
+            .bearer("bad\nvalue")
+            .await
+        {
+            Ok(response) => return Err(format!("expected auth error, got {response:?}").into()),
+            Err(error) => error,
+        };
+        match error.kind() {
+            ErrorKind::Auth { operation, scheme } => {
+                assert_eq!(*operation, "bearer");
+                assert_eq!(*scheme, "Bearer");
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_and_response_save_write_body_to_file()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0, 1, 2, 3]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+
+        let root =
+            std::env::temp_dir().join(format!("easy-rust-request-download-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let downloaded = root.join("nested/file.bin");
+        let saved = root.join("saved/file.bin");
+
+        let path = download(
+            format!("{}/file", server.uri()),
+            downloaded.display().to_string(),
+        )
+        .await?;
+        assert_eq!(std::fs::read(path.as_std_path())?, vec![0, 1, 2, 3]);
+
+        let response = get(format!("{}/file", server.uri())).await?;
+        let saved_path = response.save(saved.display().to_string())?;
+        assert_eq!(std::fs::read(saved_path.as_std_path())?, vec![0, 1, 2, 3]);
+
+        let error = match download(
+            format!("{}/missing", server.uri()),
+            root.join("missing.bin").display().to_string(),
+        )
+        .await
+        {
+            Ok(path) => return Err(format!("expected download error, got {path}").into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("download"));
+        assert!(error.to_string().contains("404"));
+
+        let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
 

@@ -9,6 +9,10 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit as AesKeyInit},
 };
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{Error as PasswordHashError, SaltString},
+};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer, SigningKey as Ed25519SigningKey, Verifier,
     VerifyingKey as Ed25519VerifyingKey,
@@ -31,6 +35,7 @@ const ED25519_SECRET_LEN: usize = 32;
 const ED25519_PUBLIC_LEN: usize = 32;
 const ED25519_SIGNATURE_LEN: usize = 64;
 const SECP256K1_SECRET_LEN: usize = 32;
+const PASSWORD_SALT_LEN: usize = 16;
 
 /// crypto 模块统一使用的结果类型。
 ///
@@ -141,6 +146,15 @@ pub enum ErrorKind {
         /// 面向人的错误说明。
         message: String,
     },
+
+    /// 密码哈希或验证失败。
+    #[error("crypto {operation} password failed: {message}")]
+    Password {
+        /// 发生错误的操作名，例如 `password_hash`。
+        operation: &'static str,
+        /// 面向人的错误说明。
+        message: String,
+    },
 }
 
 /// 公钥和私钥字节对。
@@ -245,6 +259,47 @@ pub fn ripemd160(input: impl AsRef<[u8]>) -> String {
 pub fn hash160(input: impl AsRef<[u8]>) -> String {
     let sha = Sha256::digest(input.as_ref());
     ripemd160(sha)
+}
+
+/// 生成安全密码哈希字符串。
+///
+/// 使用 Argon2id 默认参数和内部随机 salt，返回 PHC 字符串，可直接保存到数据库。调用方不需要
+/// 自己管理 salt 或算法参数。
+pub fn password_hash(password: impl AsRef<[u8]>) -> Result<String> {
+    let salt_bytes = random_array::<PASSWORD_SALT_LEN>("password_hash")?;
+    let salt = SaltString::encode_b64(&salt_bytes).map_err(|source| ErrorKind::Password {
+        operation: "password_hash",
+        message: source.to_string(),
+    })?;
+    Argon2::default()
+        .hash_password(password.as_ref(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|source| {
+            ErrorKind::Password {
+                operation: "password_hash",
+                message: source.to_string(),
+            }
+            .into()
+        })
+}
+
+/// 验证密码是否匹配已保存的哈希。
+///
+/// 密码不匹配返回 `Ok(false)`；哈希字符串格式错误或算法无法处理时返回 [`ErrorKind::Password`]。
+pub fn password_verify(password: impl AsRef<[u8]>, hash: impl AsRef<str>) -> Result<bool> {
+    let parsed = PasswordHash::new(hash.as_ref()).map_err(|source| ErrorKind::Password {
+        operation: "password_verify",
+        message: source.to_string(),
+    })?;
+    match Argon2::default().verify_password(password.as_ref(), &parsed) {
+        Ok(()) => Ok(true),
+        Err(PasswordHashError::Password) => Ok(false),
+        Err(source) => Err(ErrorKind::Password {
+            operation: "password_verify",
+            message: source.to_string(),
+        }
+        .into()),
+    }
 }
 
 /// 生成 32 字节 AES-256 密钥。
@@ -493,6 +548,34 @@ mod tests {
         assert!(secure_eq("same", "same"));
         assert!(!secure_eq("same", "diff"));
         assert!(!secure_eq("same", "same!"));
+    }
+
+    #[test]
+    fn password_hash_and_verify_use_safe_password_semantics()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let hash = password_hash("correct horse battery staple")?;
+
+        assert!(hash.starts_with("$argon2"));
+        assert!(password_verify("correct horse battery staple", &hash)?);
+        assert!(!password_verify("wrong password", &hash)?);
+        Ok(())
+    }
+
+    #[test]
+    fn password_verify_rejects_invalid_hash() -> std::result::Result<(), Box<dyn StdError>> {
+        let error = match password_verify("password", "not-a-password-hash") {
+            Ok(value) => return Err(format!("expected password hash error, got {value}").into()),
+            Err(error) => error,
+        };
+
+        match error.kind() {
+            ErrorKind::Password { operation, .. } => {
+                assert_eq!(*operation, "password_verify");
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+        assert!(error.to_string().contains("password_verify"));
+        Ok(())
     }
 
     #[test]

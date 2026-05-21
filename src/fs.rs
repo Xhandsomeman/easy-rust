@@ -173,6 +173,15 @@ pub enum ErrorKind {
         /// 发生错误的路径。
         path: Path,
     },
+
+    /// 文件锁操作失败。
+    #[error("fs {operation} `{path}` failed")]
+    Lock {
+        /// 发生错误的操作名，例如 `lock` 或 `unlock`。
+        operation: &'static str,
+        /// 发生错误的路径。
+        path: Path,
+    },
 }
 
 /// easy-rust 的高层路径对象。
@@ -238,9 +247,26 @@ impl Path {
         read_text(self)
     }
 
+    /// 读取路径对应文件的文本行。
+    ///
+    /// 返回值不包含换行符；空行会保留为空字符串。
+    pub fn read_lines(&self) -> Result<Vec<String>> {
+        read_lines(self)
+    }
+
     /// 写入 UTF-8 文本，并自动创建父目录。
     pub fn write_text(&self, text: impl AsRef<str>) -> Result<()> {
         write_text(self, text)
+    }
+
+    /// 写入多行文本，并自动创建父目录。
+    ///
+    /// 每一行都会写入一个 `\n`，空列表会创建空文件。
+    pub fn write_lines<S>(&self, lines: impl IntoIterator<Item = S>) -> Result<()>
+    where
+        S: AsRef<str>,
+    {
+        write_lines(self, lines)
     }
 
     /// 读取路径对应文件的字节内容。
@@ -352,6 +378,61 @@ impl Path {
     pub fn absolute(&self) -> Result<Path> {
         absolute(self)
     }
+
+    /// 对当前路径加阻塞独占锁。
+    ///
+    /// 锁文件会自动创建。返回的 [`Lock`] 在调用 `unlock()` 或离开作用域时释放锁。
+    pub fn lock(&self) -> Result<Lock> {
+        lock(self)
+    }
+}
+
+/// 文件独占锁。
+///
+/// 由 [`lock`] 或 [`Path::lock`] 创建。这个类型只表示“当前进程持有某个锁文件”，不会暴露底层
+/// `File`。需要提前释放时调用 [`unlock`](Self::unlock)，否则离开作用域时会尽力释放。
+#[derive(Debug)]
+pub struct Lock {
+    path: Path,
+    file: Option<std_fs::File>,
+}
+
+impl Lock {
+    /// 返回锁文件路径。
+    ///
+    /// 适合写日志或调试，不会暴露底层文件句柄。
+    #[must_use]
+    pub fn path(&self) -> Path {
+        self.path.clone()
+    }
+
+    /// 释放文件锁。
+    ///
+    /// 成功后会消费当前锁对象；释放失败时返回 [`ErrorKind::Lock`]。
+    pub fn unlock(mut self) -> Result<()> {
+        self.unlock_inner()
+    }
+
+    fn unlock_inner(&mut self) -> Result<()> {
+        let Some(file) = self.file.take() else {
+            return Ok(());
+        };
+        file.unlock().map_err(|source| {
+            Error::with_source(
+                ErrorKind::Lock {
+                    operation: "unlock",
+                    path: self.path.clone(),
+                },
+                source,
+            )
+        })
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = self.unlock_inner();
+    }
 }
 
 impl fmt::Display for Path {
@@ -405,9 +486,31 @@ pub fn read_text(path: impl Into<Path>) -> Result<String> {
         .map_err(|source| Error::with_source(ErrorKind::Read { path }, source))
 }
 
+/// 读取文件为文本行。
+///
+/// 返回值不包含换行符；空行会保留为空字符串。无法读取文件时返回 [`ErrorKind::Read`]。
+pub fn read_lines(path: impl Into<Path>) -> Result<Vec<String>> {
+    Ok(read_text(path)?.lines().map(ToOwned::to_owned).collect())
+}
+
 /// 写入 UTF-8 文本，并自动创建父目录。
 pub fn write_text(path: impl Into<Path>, text: impl AsRef<str>) -> Result<()> {
     write_bytes(path, text.as_ref().as_bytes())
+}
+
+/// 写入文本行，并自动创建父目录。
+///
+/// 每一行都会写入一个 `\n`，空列表会创建空文件。无法写入文件时返回 [`ErrorKind::Write`]。
+pub fn write_lines<S>(path: impl Into<Path>, lines: impl IntoIterator<Item = S>) -> Result<()>
+where
+    S: AsRef<str>,
+{
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line.as_ref());
+        text.push('\n');
+    }
+    write_text(path, text)
 }
 
 /// 读取文件为字节数组。
@@ -639,6 +742,42 @@ pub fn absolute(path: impl Into<Path>) -> Result<Path> {
     };
     Ok(Path {
         inner: normalize_path(full),
+    })
+}
+
+/// 对路径加阻塞独占锁。
+///
+/// 锁文件不存在时会自动创建，父目录也会自动创建。返回的 [`Lock`] 离开作用域时会自动释放锁。
+pub fn lock(path: impl Into<Path>) -> Result<Lock> {
+    let path = path.into();
+    create_parent_dirs(&path)?;
+    let file = std_fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path.inner)
+        .map_err(|source| {
+            Error::with_source(
+                ErrorKind::Lock {
+                    operation: "lock",
+                    path: path.clone(),
+                },
+                source,
+            )
+        })?;
+    file.lock().map_err(|source| {
+        Error::with_source(
+            ErrorKind::Lock {
+                operation: "lock",
+                path: path.clone(),
+            },
+            source,
+        )
+    })?;
+    Ok(Lock {
+        path,
+        file: Some(file),
     })
 }
 
@@ -931,6 +1070,33 @@ mod tests {
     }
 
     #[test]
+    fn read_lines_and_write_lines_use_simple_line_semantics()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("lines")?;
+        let file = path(path_text(&root)).join("nested/lines.txt");
+
+        file.write_lines(["one", "", "three"])?;
+        assert_eq!(
+            file.read_lines()?,
+            vec!["one".to_owned(), String::new(), "three".to_owned()]
+        );
+
+        let no_tail = path(path_text(&root)).join("no-tail.txt");
+        no_tail.write_text("alpha\nbeta")?;
+        assert_eq!(
+            read_lines(&no_tail)?,
+            vec!["alpha".to_owned(), "beta".to_owned()]
+        );
+
+        let empty = path(path_text(&root)).join("empty.txt");
+        write_lines(&empty, Vec::<String>::new())?;
+        assert_eq!(empty.read_text()?, "");
+
+        remove(path_text(&root))?;
+        Ok(())
+    }
+
+    #[test]
     fn write_json_is_pretty_and_read_json_decodes() -> std::result::Result<(), Box<dyn StdError>> {
         let root = temp_root("json")?;
         let file = root.join("data/user.json");
@@ -1144,6 +1310,24 @@ mod tests {
         file.write_text("hello")?;
         assert_eq!(file.read_text()?, "hello");
         file.remove()?;
+        Ok(())
+    }
+
+    #[test]
+    fn lock_creates_file_and_can_unlock_explicitly() -> std::result::Result<(), Box<dyn StdError>> {
+        let root = temp_root("lock")?;
+        let lock_path = path(path_text(&root)).join("nested/app.lock");
+
+        let guard = lock(&lock_path)?;
+        assert!(lock_path.exists());
+        assert_eq!(guard.path().display(), lock_path.display());
+        guard.unlock()?;
+
+        let guard = lock_path.lock()?;
+        drop(guard);
+        lock_path.remove()?;
+        assert!(!lock_path.exists());
+        remove(path_text(&root))?;
         Ok(())
     }
 

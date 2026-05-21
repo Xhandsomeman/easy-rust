@@ -1,16 +1,17 @@
 [package]
 name = "easy-rust"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.94"
 description = "Python-like ergonomics for production-grade Rust."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bytes = "1.11.1"
-base64_crate = { package = "base64", version = "0.22" }
 aes-gcm = "0.10"
+argon2 = "0.5"
+base64_crate = { package = "base64", version = "0.22" }
 bs58 = "0.5"
+bytes = "1.11.1"
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 csv_crate = { package = "csv", version = "1" }
 ed25519-dalek = "2"
@@ -18,6 +19,7 @@ encoding_rs = "0.8.35"
 flate2 = "1"
 getrandom = "0.3.4"
 hmac = "0.13"
+hostname = "0.4"
 http = "1.4.0"
 httpdate = "1.0.3"
 k256 = { version = "0.13", features = ["ecdsa"] }
@@ -35,8 +37,10 @@ subtle = "2"
 tar_crate = { package = "tar", version = "0.4.46" }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "net"] }
+toml = "1.1"
 url_crate = { package = "url", version = "2.5.8" }
 uuid_crate = { package = "uuid", version = "1.23.1", features = ["v4"] }
+yaml_serde = "0.10"
 zip_crate = { package = "zip", version = "6.0.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
