@@ -2,5 +2,8 @@
 
 pub use crate::{
     cache, cmd, codec, compress, config, crawler, crypto, csv, data, fs, json, log, random, regex,
-    sqlite, system, text, time, url, uuid,
+    system, text, time, url, uuid,
 };
+
+#[cfg(feature = "sqlite")]
+pub use crate::sqlite;

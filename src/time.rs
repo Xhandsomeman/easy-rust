@@ -286,6 +286,41 @@ pub fn hours(hours: u64) -> Duration {
     Duration::from_secs(hours.saturating_mul(60).saturating_mul(60))
 }
 
+/// 把时间长度格式化成易读文本。
+///
+/// 最多显示两个最大的非零单位，例如 `65` 秒会显示为 `1m 5s`，`1500` 毫秒会显示为
+/// `1s 500ms`。零长度显示为 `0s`。
+#[must_use]
+pub fn format_duration(duration: Duration) -> String {
+    let mut rest = duration.as_millis();
+    if rest == 0 {
+        return "0s".to_owned();
+    }
+
+    let units = [
+        ("d", 86_400_000_u128),
+        ("h", 3_600_000_u128),
+        ("m", 60_000_u128),
+        ("s", 1_000_u128),
+        ("ms", 1_u128),
+    ];
+    let mut parts = Vec::new();
+
+    for (name, size) in units {
+        let value = rest / size;
+        if value == 0 {
+            continue;
+        }
+        parts.push(format!("{value}{name}"));
+        rest %= size;
+        if parts.len() == 2 {
+            break;
+        }
+    }
+
+    parts.join(" ")
+}
+
 fn format_inner(
     value: &ChronoDateTime<Local>,
     pattern: &str,
@@ -422,5 +457,14 @@ mod tests {
         assert_eq!(hours(2), Duration::from_secs(7200));
         assert_eq!(minutes(u64::MAX), Duration::from_secs(u64::MAX));
         assert_eq!(hours(u64::MAX), Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn format_duration_uses_two_readable_units() {
+        assert_eq!(format_duration(Duration::ZERO), "0s");
+        assert_eq!(format_duration(millis(250)), "250ms");
+        assert_eq!(format_duration(millis(1500)), "1s 500ms");
+        assert_eq!(format_duration(seconds(65)), "1m 5s");
+        assert_eq!(format_duration(hours(25) + minutes(3)), "1d 1h");
     }
 }

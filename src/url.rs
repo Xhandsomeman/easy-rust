@@ -3,7 +3,7 @@
 //! 这个模块提供 URL 解析、拼接、查询串生成和组件编码解码。普通场景只需要
 //! [`parse`]、[`join`]、[`encode`]、[`decode`] 和 [`query`]。
 
-use std::{error::Error as StdError, fmt};
+use std::{error::Error as StdError, fmt, net::IpAddr};
 
 use serde::Serialize;
 
@@ -113,6 +113,17 @@ pub enum ErrorKind {
     Query {
         /// 发生错误的操作名，例如 `query`。
         operation: &'static str,
+    },
+
+    /// URL 不适合作为后台请求目标。
+    #[error("url {operation} `{input}` failed: {message}")]
+    Unsafe {
+        /// 发生错误的操作名，例如 `check_safe`。
+        operation: &'static str,
+        /// 输入内容预览。
+        input: String,
+        /// 面向人的安全检查错误说明。
+        message: String,
     },
 }
 
@@ -270,6 +281,34 @@ pub fn parse(input: impl AsRef<str>) -> Result<Url> {
         })
 }
 
+/// 检查 URL 是否适合作为后台请求目标。
+///
+/// 只允许 `http` 和 `https`，必须包含 host，并拒绝账号密码、`localhost` 和明显的本地、
+/// 私有或保留 IP 字面量。这个函数只做静态输入检查，不做 DNS 解析，也不承诺完整 SSRF 防护。
+pub fn check_safe(input: impl AsRef<str>) -> Result<Url> {
+    let input = input.as_ref();
+    let inner = url_crate::Url::parse(input).map_err(|source| {
+        Error::with_source(
+            ErrorKind::Unsafe {
+                operation: "check_safe",
+                input: input_preview(input),
+                message: "must be an absolute http or https URL".to_owned(),
+            },
+            source,
+        )
+    })?;
+    check_safe_inner(input, &inner)?;
+    Ok(Url { inner })
+}
+
+/// 判断 URL 是否适合作为后台请求目标。
+///
+/// 这是 [`check_safe`] 的布尔入口；需要错误上下文时请使用 [`check_safe`]。
+#[must_use]
+pub fn is_safe(input: impl AsRef<str>) -> bool {
+    check_safe(input).is_ok()
+}
+
 /// 基于基础 URL 拼接相对路径。
 ///
 /// `base` 可以是字符串或已解析的 URL 字符串。拼接失败时返回 [`ErrorKind::Join`]。
@@ -369,6 +408,95 @@ where
 fn decode_error(input: &str, message: &str) -> Error {
     ErrorKind::Decode {
         operation: "decode",
+        input: input_preview(input),
+        message: message.to_owned(),
+    }
+    .into()
+}
+
+fn check_safe_inner(input: &str, url: &url_crate::Url) -> Result<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(unsafe_error(input, "scheme must be http or https"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(unsafe_error(input, "username and password are not allowed"));
+    }
+
+    let Some(host) = url.host_str() else {
+        return Err(unsafe_error(input, "host is required"));
+    };
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(unsafe_error(input, "localhost is not allowed"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        check_safe_ip(input, ip)?;
+    }
+
+    Ok(())
+}
+
+fn check_safe_ip(input: &str, ip: IpAddr) -> Result<()> {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            let private = octets[0] == 10
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168);
+            let local = octets[0] == 0
+                || octets[0] == 127
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]));
+            let reserved = octets[0] >= 224
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] <= 2)
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
+            if private || local || reserved {
+                return Err(unsafe_error(
+                    input,
+                    "local, private or reserved IP is not allowed",
+                ));
+            }
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            let local = ip.is_loopback()
+                || ip.is_unspecified()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80;
+            let reserved = (segments[0] & 0xff00) == 0xff00
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8);
+            let mapped_v4 = segments[0] == 0
+                && segments[1] == 0
+                && segments[2] == 0
+                && segments[3] == 0
+                && segments[4] == 0
+                && segments[5] == 0xffff;
+            if local || reserved {
+                return Err(unsafe_error(
+                    input,
+                    "local, private or reserved IP is not allowed",
+                ));
+            }
+            if mapped_v4 {
+                let octets = [
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                ];
+                check_safe_ip(input, IpAddr::from(octets))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn unsafe_error(input: &str, message: &str) -> Error {
+    ErrorKind::Unsafe {
+        operation: "check_safe",
         input: input_preview(input),
         message: message.to_owned(),
     }
@@ -531,6 +659,44 @@ mod tests {
             "https://example.com/search?q=rust&page=2&debug=true&sort=new&name=Ada+Lovelace#top"
         );
         assert_eq!(clean.as_str(), "https://example.com/search#top");
+        Ok(())
+    }
+
+    #[test]
+    fn safe_url_check_accepts_only_public_http_targets()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let safe = check_safe("https://example.com/api")?;
+
+        assert_eq!(safe.host(), Some("example.com"));
+        assert!(is_safe("http://example.com"));
+        assert!(!is_safe("/relative/path"));
+        assert!(!is_safe("file:///tmp/a.txt"));
+        assert!(!is_safe("https://user:pass@example.com"));
+        assert!(!is_safe("http://localhost"));
+        assert!(!is_safe("http://127.0.0.1"));
+        assert!(!is_safe("http://192.168.1.1"));
+        assert!(!is_safe("http://[::1]"));
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_url_error_contains_operation_and_input() -> std::result::Result<(), Box<dyn StdError>>
+    {
+        let error = match check_safe("http://localhost/admin") {
+            Ok(value) => return Err(format!("expected unsafe URL error, got {value}").into()),
+            Err(error) => error,
+        };
+
+        match error.kind() {
+            ErrorKind::Unsafe {
+                operation, input, ..
+            } => {
+                assert_eq!(*operation, "check_safe");
+                assert_eq!(input, "http://localhost/admin");
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+        assert!(error.to_string().contains("localhost"));
         Ok(())
     }
 

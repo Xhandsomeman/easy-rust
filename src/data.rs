@@ -4,11 +4,13 @@
 //! 它不要求用户导入额外能力，也不会返回需要继续组合的惰性对象。
 
 use std::{
+    any::type_name,
     borrow::Borrow,
     collections::{HashMap, HashSet, hash_map::Entry},
     error::Error as StdError,
     fmt,
     hash::Hash,
+    str::FromStr,
 };
 
 /// data 模块统一使用的结果类型。
@@ -65,6 +67,30 @@ pub enum ErrorKind {
         /// 调用方传入的无效大小。
         size: usize,
     },
+
+    /// 必填表单字段不存在。
+    #[error("data {operation} form `{key}` is required")]
+    Required {
+        /// 发生错误的操作名，例如 `require`。
+        operation: &'static str,
+        /// 缺失的字段名。
+        key: String,
+    },
+
+    /// 表单字段类型转换失败。
+    #[error("data {operation} form `{key}` value `{value}` failed: expected {expected}: {message}")]
+    Type {
+        /// 发生错误的操作名，例如 `get`。
+        operation: &'static str,
+        /// 发生错误的字段名。
+        key: String,
+        /// 发生错误的字段值。
+        value: String,
+        /// 期望的 Rust 类型名。
+        expected: &'static str,
+        /// 面向人的错误说明。
+        message: String,
+    },
 }
 
 /// Python `Counter` 风格的计数结果。
@@ -114,6 +140,113 @@ where
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.counts.is_empty()
+    }
+}
+
+/// 运行时表单字段集合。
+///
+/// 使用 [`form`] 创建。适合处理动态表单、查询参数或后台字段列表；字段值统一先按文本保存，
+/// 读取时再转换成需要的类型。空字符串和纯空白字段按缺失处理。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Form {
+    values: HashMap<String, Vec<String>>,
+}
+
+impl Form {
+    /// 读取可选字段并转换类型。
+    ///
+    /// 字段不存在或字段值为空白时返回 `Ok(None)`；字段存在但不能转换成 `T` 时返回
+    /// [`ErrorKind::Type`]。
+    pub fn get<T>(&self, name: impl AsRef<str>) -> Result<Option<T>>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        self.parse_value("get", name.as_ref())
+    }
+
+    /// 读取字段，缺失时返回默认值。
+    ///
+    /// 字段不存在或字段值为空白时返回 `default`；字段存在但不能转换成 `T` 时返回
+    /// [`ErrorKind::Type`]。
+    pub fn get_or<T>(&self, name: impl AsRef<str>, default: T) -> Result<T>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        Ok(self
+            .parse_value("get_or", name.as_ref())?
+            .unwrap_or(default))
+    }
+
+    /// 读取必填字段并转换类型。
+    ///
+    /// 字段不存在或字段值为空白时返回 [`ErrorKind::Required`]；字段存在但不能转换成 `T` 时返回
+    /// [`ErrorKind::Type`]。
+    pub fn require<T>(&self, name: impl AsRef<str>) -> Result<T>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        let name = name.as_ref();
+        self.parse_value("require", name)?.ok_or_else(|| {
+            ErrorKind::Required {
+                operation: "require",
+                key: name.to_owned(),
+            }
+            .into()
+        })
+    }
+
+    /// 读取字段文本。
+    ///
+    /// 重复字段会返回最后一个非空白值；字段不存在或全部为空白时返回 `None`。
+    #[must_use]
+    pub fn text(&self, name: impl AsRef<str>) -> Option<String> {
+        self.last_value(name.as_ref()).map(str::to_owned)
+    }
+
+    /// 返回字段出现过的所有非空白值。
+    ///
+    /// 返回顺序保持输入顺序。空字符串和纯空白字段会被跳过。
+    #[must_use]
+    pub fn values(&self, name: impl AsRef<str>) -> Vec<String> {
+        self.values
+            .get(name.as_ref())
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .collect()
+    }
+
+    fn parse_value<T>(&self, operation: &'static str, name: &str) -> Result<Option<T>>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        let Some(value) = self.last_value(name) else {
+            return Ok(None);
+        };
+        value.parse::<T>().map(Some).map_err(|source| {
+            ErrorKind::Type {
+                operation,
+                key: name.to_owned(),
+                value: value.to_owned(),
+                expected: type_name::<T>(),
+                message: source.to_string(),
+            }
+            .into()
+        })
+    }
+
+    fn last_value(&self, name: &str) -> Option<&str> {
+        self.values
+            .get(name)?
+            .iter()
+            .rev()
+            .find(|value| !value.trim().is_empty())
+            .map(String::as_str)
     }
 }
 
@@ -201,6 +334,27 @@ where
     K: Eq + Hash,
 {
     pairs.into_iter().collect()
+}
+
+/// 把键值列表收集成运行时表单。
+///
+/// 重复字段会全部保留；读取单个值时使用最后一个非空白值。适合把 HTTP 表单、查询参数或
+/// 临时字段列表转换成可按类型读取的结构。
+#[must_use]
+pub fn form<I, K, V>(items: I) -> Form
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: ToString,
+{
+    let mut form = Form::default();
+    for (key, value) in items {
+        form.values
+            .entry(key.as_ref().to_owned())
+            .or_default()
+            .push(value.to_string());
+    }
+    form
 }
 
 /// 对每个元素执行映射，并立即返回列表。
@@ -358,6 +512,59 @@ mod tests {
     }
 
     #[test]
+    fn form_reads_runtime_values_with_types_and_defaults()
+    -> std::result::Result<(), Box<dyn StdError>> {
+        let form = form([
+            ("name", "Ada"),
+            ("page", "1"),
+            ("debug", "true"),
+            ("tag", "rust"),
+            ("tag", "easy"),
+            ("blank", "  "),
+        ]);
+
+        assert_eq!(form.text("name"), Some("Ada".to_owned()));
+        assert_eq!(form.get::<u32>("page")?, Some(1));
+        assert!(form.require::<bool>("debug")?);
+        assert_eq!(form.get_or("limit", 20_u32)?, 20);
+        assert_eq!(form.get::<String>("blank")?, None);
+        assert_eq!(
+            form.values("tag"),
+            vec!["rust".to_owned(), "easy".to_owned()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn form_reports_required_and_type_errors() -> std::result::Result<(), Box<dyn StdError>> {
+        let form = form([("page", "abc"), ("name", " ")]);
+        let required = match form.require::<String>("name") {
+            Ok(value) => return Err(format!("expected required error, got {value}").into()),
+            Err(error) => error,
+        };
+        let typed = match form.get::<u32>("page") {
+            Ok(value) => return Err(format!("expected type error, got {value:?}").into()),
+            Err(error) => error,
+        };
+
+        match required.kind() {
+            ErrorKind::Required { operation, key } => {
+                assert_eq!(*operation, "require");
+                assert_eq!(key, "name");
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+        match typed.kind() {
+            ErrorKind::Type { operation, key, .. } => {
+                assert_eq!(*operation, "get");
+                assert_eq!(key, "page");
+            }
+            other => return Err(format!("unexpected error: {other}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn counter_counts_and_keeps_tie_order() {
         let counts = counter(["a", "b", "a", "c", "b"]);
 
@@ -424,6 +631,7 @@ mod tests {
                 assert_eq!(*operation, "chunked");
                 assert_eq!(*size, 0);
             }
+            other => return Err(format!("unexpected error: {other}").into()),
         }
 
         Ok(())

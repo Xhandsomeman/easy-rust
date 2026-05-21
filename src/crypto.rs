@@ -189,13 +189,27 @@ impl KeyPair {
 /// 计算 SHA-256 十六进制摘要。
 #[must_use]
 pub fn sha256(input: impl AsRef<[u8]>) -> String {
-    hex(Sha256::digest(input.as_ref()))
+    hex(sha256_bytes(input))
+}
+
+/// 计算 SHA-256 原始字节摘要。
+///
+/// 适合链上地址生成、二进制协议拼接等不希望先转成十六进制字符串的场景。
+#[must_use]
+pub fn sha256_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
+    Sha256::digest(input.as_ref()).to_vec()
 }
 
 /// 计算 SHA-512 十六进制摘要。
 #[must_use]
 pub fn sha512(input: impl AsRef<[u8]>) -> String {
-    hex(Sha512::digest(input.as_ref()))
+    hex(sha512_bytes(input))
+}
+
+/// 计算 SHA-512 原始字节摘要。
+#[must_use]
+pub fn sha512_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
+    Sha512::digest(input.as_ref()).to_vec()
 }
 
 /// 读取文件并计算 SHA-256 十六进制摘要。
@@ -205,6 +219,13 @@ pub fn file_sha256(path: impl Into<FsPath>) -> Result<String> {
     Ok(sha256(bytes))
 }
 
+/// 读取文件并计算 SHA-256 原始字节摘要。
+pub fn file_sha256_bytes(path: impl Into<FsPath>) -> Result<Vec<u8>> {
+    let path = path.into();
+    let bytes = read_file("file_sha256_bytes", &path)?;
+    Ok(sha256_bytes(bytes))
+}
+
 /// 读取文件并计算 SHA-512 十六进制摘要。
 pub fn file_sha512(path: impl Into<FsPath>) -> Result<String> {
     let path = path.into();
@@ -212,24 +233,43 @@ pub fn file_sha512(path: impl Into<FsPath>) -> Result<String> {
     Ok(sha512(bytes))
 }
 
+/// 读取文件并计算 SHA-512 原始字节摘要。
+pub fn file_sha512_bytes(path: impl Into<FsPath>) -> Result<Vec<u8>> {
+    let path = path.into();
+    let bytes = read_file("file_sha512_bytes", &path)?;
+    Ok(sha512_bytes(bytes))
+}
+
 /// 计算 HMAC-SHA256 十六进制摘要。
 #[must_use]
 pub fn hmac_sha256(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> String {
+    hex(hmac_sha256_bytes(key, data))
+}
+
+/// 计算 HMAC-SHA256 原始字节摘要。
+#[must_use]
+pub fn hmac_sha256_bytes(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> Vec<u8> {
     let Ok(mut mac) = <Hmac<Sha256> as HmacKeyInit>::new_from_slice(key.as_ref()) else {
-        return String::new();
+        return Vec::new();
     };
     mac.update(data.as_ref());
-    hex(mac.finalize().into_bytes())
+    mac.finalize().into_bytes().to_vec()
 }
 
 /// 计算 HMAC-SHA512 十六进制摘要。
 #[must_use]
 pub fn hmac_sha512(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> String {
+    hex(hmac_sha512_bytes(key, data))
+}
+
+/// 计算 HMAC-SHA512 原始字节摘要。
+#[must_use]
+pub fn hmac_sha512_bytes(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> Vec<u8> {
     let Ok(mut mac) = <Hmac<Sha512> as HmacKeyInit>::new_from_slice(key.as_ref()) else {
-        return String::new();
+        return Vec::new();
     };
     mac.update(data.as_ref());
-    hex(mac.finalize().into_bytes())
+    mac.finalize().into_bytes().to_vec()
 }
 
 /// 常量时间比较两个字节序列是否相等。
@@ -247,20 +287,39 @@ pub fn secure_eq(left: impl AsRef<[u8]>, right: impl AsRef<[u8]>) -> bool {
 /// 这是以太坊等链上场景常用的 Keccak，不是 NIST SHA3-256。
 #[must_use]
 pub fn keccak256(input: impl AsRef<[u8]>) -> String {
-    hex(Keccak256::digest(input.as_ref()))
+    hex(keccak256_bytes(input))
+}
+
+/// 计算 Keccak-256 原始字节摘要。
+///
+/// 这是以太坊等链上场景常用的 Keccak，不是 NIST SHA3-256。
+#[must_use]
+pub fn keccak256_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
+    Keccak256::digest(input.as_ref()).to_vec()
 }
 
 /// 计算 RIPEMD-160 十六进制摘要。
 #[must_use]
 pub fn ripemd160(input: impl AsRef<[u8]>) -> String {
-    hex(Ripemd160::digest(input.as_ref()))
+    hex(ripemd160_bytes(input))
+}
+
+/// 计算 RIPEMD-160 原始字节摘要。
+#[must_use]
+pub fn ripemd160_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
+    Ripemd160::digest(input.as_ref()).to_vec()
 }
 
 /// 计算 Bitcoin 风格 HASH160：RIPEMD160(SHA256(data))。
 #[must_use]
 pub fn hash160(input: impl AsRef<[u8]>) -> String {
-    let sha = Sha256::digest(input.as_ref());
-    ripemd160(sha)
+    hex(hash160_bytes(input))
+}
+
+/// 计算 Bitcoin 风格 HASH160 原始字节：RIPEMD160(SHA256(data))。
+#[must_use]
+pub fn hash160_bytes(input: impl AsRef<[u8]>) -> Vec<u8> {
+    ripemd160_bytes(sha256_bytes(input))
 }
 
 /// 生成安全密码哈希字符串。
@@ -509,11 +568,17 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
+            hex(sha256_bytes("abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(sha256_bytes("abc").len(), 32);
+        assert_eq!(
             sha512("abc"),
             "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
              2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
                 .replace(' ', "")
         );
+        assert_eq!(sha512_bytes("abc").len(), 64);
     }
 
     #[test]
@@ -528,6 +593,8 @@ mod tests {
         let path = path.display().to_string();
         assert_eq!(file_sha256(&path)?, sha256("abc"));
         assert_eq!(file_sha512(&path)?, sha512("abc"));
+        assert_eq!(file_sha256_bytes(&path)?, sha256_bytes("abc"));
+        assert_eq!(file_sha512_bytes(&path)?, sha512_bytes("abc"));
         Ok(())
     }
 
@@ -538,11 +605,29 @@ mod tests {
             "5031fe3d989c6d1537a013fa6e739da23463fdaec3b70137d828e36ace221bd0"
         );
         assert_eq!(
+            hex(hmac_sha256_bytes("key", "data")),
+            "5031fe3d989c6d1537a013fa6e739da23463fdaec3b70137d828e36ace221bd0"
+        );
+        assert_eq!(hmac_sha512_bytes("key", "data").len(), 64);
+        assert_eq!(
             keccak256(""),
             "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
         );
+        assert_eq!(
+            hex(keccak256_bytes("")),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+        );
         assert_eq!(ripemd160(""), "9c1185a5c5e9fc54612808977ee8f548b2258d31");
+        assert_eq!(
+            hex(ripemd160_bytes("")),
+            "9c1185a5c5e9fc54612808977ee8f548b2258d31"
+        );
         assert_eq!(hash160(""), "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb");
+        assert_eq!(
+            hex(hash160_bytes("")),
+            "b472a266d0bd89c13706a4132ccfb16f7c3b9fcb"
+        );
+        assert_eq!(hash160_bytes("").len(), 20);
     }
 
     #[test]

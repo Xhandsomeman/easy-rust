@@ -19,6 +19,7 @@ pub mod prelude;
 pub mod random;
 pub mod regex;
 pub mod request;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod system;
 pub mod text;
@@ -49,6 +50,7 @@ mod tests {
         assert_send_sync::<random::Error>();
         assert_send_sync::<regex::Error>();
         assert_send_sync::<request::Error>();
+        #[cfg(feature = "sqlite")]
         assert_send_sync::<sqlite::Error>();
         assert_send_sync::<system::Error>();
         assert_send_sync::<text::Error>();

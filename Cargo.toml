@@ -1,10 +1,14 @@
 [package]
 name = "easy-rust"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 rust-version = "1.94"
 description = "Python-like ergonomics for production-grade Rust."
 license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
 
 [dependencies]
 aes-gcm = "0.10"
@@ -26,7 +30,7 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "charset", "http2", "system-proxy", "gzip", "brotli", "zstd", "deflate", "cookies", "query", "form", "multipart", "blocking"] }
 regex_crate = { package = "regex", version = "1" }
 ripemd = "0.2"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
 scraper_crate = { package = "scraper", version = "0.27" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

@@ -1,6 +1,6 @@
 //! 极简字符串处理 API。
 //!
-//! 这个模块提供脚本和后端最常用的字符串处理能力：清洗空白、截断、大小写转换、slug 和简单模板替换。
+//! 这个模块提供脚本和后端最常用的字符串处理能力：清洗空白、按标记截取、截断、大小写转换、slug 和简单模板替换。
 
 use std::{collections::HashMap, error::Error as StdError, fmt};
 
@@ -142,6 +142,145 @@ pub fn to_half_width(text: impl AsRef<str>) -> String {
             _ => character,
         })
         .collect()
+}
+
+/// 判断文本是否为空或只包含空白。
+///
+/// 适合校验表单、配置值和采集字段。会使用 Rust 的 Unicode 空白规则；空字符串和只包含空格、
+/// 换行、制表符的字符串都会返回 `true`。
+#[must_use]
+pub fn is_blank(text: impl AsRef<str>) -> bool {
+    text.as_ref().trim().is_empty()
+}
+
+/// 文本为空白时返回默认值。
+///
+/// 适合后台表单、配置展示和日志字段兜底。`text` 为空字符串或只包含空白时返回 `default`；
+/// 否则返回原文本。
+#[must_use]
+pub fn blank_or(text: impl AsRef<str>, default: impl ToString) -> String {
+    let text = text.as_ref();
+    if is_blank(text) {
+        default.to_string()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// 把字节数格式化成易读文本。
+///
+/// 使用 1024 进制单位，常见输出如 `512 B`、`1 KB`、`1.5 KB`、`2 MB`。适合日志、
+/// 后台列表和错误信息展示。
+#[must_use]
+pub fn format_bytes(size: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+
+    if size < 1024 {
+        return format!("{size} B");
+    }
+
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if value.fract() == 0.0 || value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// 把以分为单位的金额格式化成普通数字文本。
+///
+/// 不添加币种符号，只输出千分位和两位小数，例如 `123456` 会变成 `1,234.56`。
+/// 负数会保留 `-`。
+#[must_use]
+pub fn format_money(cents: i64) -> String {
+    let negative = cents.is_negative();
+    let value = cents.unsigned_abs();
+    let whole = value / 100;
+    let fraction = value % 100;
+    let mut digits = whole.to_string();
+    let mut grouped = String::new();
+
+    while digits.len() > 3 {
+        let chunk = digits.split_off(digits.len() - 3);
+        if grouped.is_empty() {
+            grouped = chunk;
+        } else {
+            grouped = format!("{chunk},{grouped}");
+        }
+    }
+
+    if grouped.is_empty() {
+        grouped = digits;
+    } else {
+        grouped = format!("{digits},{grouped}");
+    }
+
+    if negative {
+        format!("-{grouped}.{fraction:02}")
+    } else {
+        format!("{grouped}.{fraction:02}")
+    }
+}
+
+/// 提取两个标记之间的第一段文本。
+///
+/// 会先找到 `start`，再从它后面寻找 `end`，返回中间内容。任一标记为空、找不到开始标记或结束
+/// 标记时返回 `None`。适合从固定格式文本中取出一小段内容。
+#[must_use]
+pub fn between(
+    text: impl AsRef<str>,
+    start: impl AsRef<str>,
+    end: impl AsRef<str>,
+) -> Option<String> {
+    let text = text.as_ref();
+    let start = start.as_ref();
+    let end = end.as_ref();
+
+    if start.is_empty() || end.is_empty() {
+        return None;
+    }
+
+    let (_, rest) = text.split_once(start)?;
+    let (middle, _) = rest.split_once(end)?;
+    Some(middle.to_owned())
+}
+
+/// 提取第一个标记之前的文本。
+///
+/// 找到 `marker` 时返回它左侧的内容；标记为空或不存在时返回 `None`。适合读取 `key=value`
+/// 这类简单文本的前半部分。
+#[must_use]
+pub fn before(text: impl AsRef<str>, marker: impl AsRef<str>) -> Option<String> {
+    let marker = marker.as_ref();
+    if marker.is_empty() {
+        return None;
+    }
+
+    text.as_ref()
+        .split_once(marker)
+        .map(|(left, _)| left.to_owned())
+}
+
+/// 提取第一个标记之后的文本。
+///
+/// 找到 `marker` 时返回它右侧的内容；标记为空或不存在时返回 `None`。适合读取 `key=value`
+/// 这类简单文本的后半部分。
+#[must_use]
+pub fn after(text: impl AsRef<str>, marker: impl AsRef<str>) -> Option<String> {
+    let marker = marker.as_ref();
+    if marker.is_empty() {
+        return None;
+    }
+
+    text.as_ref()
+        .split_once(marker)
+        .map(|(_, right)| right.to_owned())
 }
 
 /// 按字符数量截断字符串。
@@ -342,6 +481,55 @@ mod tests {
     fn to_half_width_converts_full_width_ascii() {
         assert_eq!(to_half_width("ＡＢＣ１２３　test！＠＃"), "ABC123 test!@#");
         assert_eq!(to_half_width("カタカナ"), "カタカナ");
+    }
+
+    #[test]
+    fn is_blank_checks_empty_or_whitespace_text() {
+        assert!(is_blank(""));
+        assert!(is_blank(" \n\t "));
+        assert!(!is_blank(" rust "));
+    }
+
+    #[test]
+    fn blank_or_and_format_helpers_make_display_text() {
+        assert_eq!(blank_or("", "N/A"), "N/A");
+        assert_eq!(blank_or(" \n ", "N/A"), "N/A");
+        assert_eq!(blank_or("Ada", "N/A"), "Ada");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(2 * 1024 * 1024), "2 MB");
+        assert_eq!(format_money(0), "0.00");
+        assert_eq!(format_money(123_456), "1,234.56");
+        assert_eq!(format_money(-123_456), "-1,234.56");
+    }
+
+    #[test]
+    fn between_extracts_text_between_markers() {
+        assert_eq!(
+            between("我喜欢美国的拉斯维加斯", "喜欢", "的"),
+            Some("美国".to_owned())
+        );
+        assert_eq!(
+            between("a[start]first[end] second[end]", "[start]", "[end]"),
+            Some("first".to_owned())
+        );
+        assert_eq!(between("hello", "[", "]"), None);
+        assert_eq!(between("hello", "", "]"), None);
+        assert_eq!(between("hello", "[", ""), None);
+    }
+
+    #[test]
+    fn before_and_after_extract_text_around_marker() {
+        assert_eq!(before("name=Ada=Lovelace", "="), Some("name".to_owned()));
+        assert_eq!(
+            after("name=Ada=Lovelace", "="),
+            Some("Ada=Lovelace".to_owned())
+        );
+        assert_eq!(before("name", "="), None);
+        assert_eq!(after("name", "="), None);
+        assert_eq!(before("name", ""), None);
+        assert_eq!(after("name", ""), None);
     }
 
     #[test]

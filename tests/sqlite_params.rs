@@ -1,5 +1,7 @@
 //! sqlite 参数宏的外部 crate 使用回归测试。
 
+#![cfg(feature = "sqlite")]
+
 use easy_rust::sqlite;
 
 #[test]

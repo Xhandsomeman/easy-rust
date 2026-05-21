@@ -142,6 +142,33 @@ where
     })
 }
 
+/// 把 JSON 文本解析成指定 Rust 类型，失败时返回默认值。
+///
+/// 这个函数仍然使用严格 JSON 规则，不支持注释、尾逗号或其它非标准写法。适合后台兜底展示，
+/// 不适合需要发现配置错误的场景；需要错误信息时请使用 [`from_str`]。
+pub fn from_str_or<T>(text: impl AsRef<str>, default: T) -> T
+where
+    T: DeserializeOwned,
+{
+    match from_str(text) {
+        Ok(value) => value,
+        Err(_) => default,
+    }
+}
+
+/// 把 JSON 字节解析成指定 Rust 类型，失败时返回默认值。
+///
+/// 这个函数仍然使用严格 JSON 规则；需要错误信息时请使用 [`from_bytes`]。
+pub fn from_bytes_or<T>(bytes: impl AsRef<[u8]>, default: T) -> T
+where
+    T: DeserializeOwned,
+{
+    match from_bytes(bytes) {
+        Ok(value) => value,
+        Err(_) => default,
+    }
+}
+
 /// 把 JSON 文本解析成动态 JSON 值。
 ///
 /// 适合处理结构未知或字段临时变化的数据。结构明确时，优先使用 [`from_str`] 解析成具体类型。
@@ -172,6 +199,28 @@ pub fn value_from_bytes(bytes: impl AsRef<[u8]>) -> Result<Value> {
             source,
         )
     })
+}
+
+/// 把 JSON 文本解析成动态 JSON 值，失败时返回默认值。
+///
+/// 这个函数仍然使用严格 JSON 规则；需要错误信息时请使用 [`value_from_str`]。
+#[must_use]
+pub fn value_from_str_or(text: impl AsRef<str>, default: Value) -> Value {
+    match value_from_str(text) {
+        Ok(value) => value,
+        Err(_) => default,
+    }
+}
+
+/// 把 JSON 字节解析成动态 JSON 值，失败时返回默认值。
+///
+/// 这个函数仍然使用严格 JSON 规则；需要错误信息时请使用 [`value_from_bytes`]。
+#[must_use]
+pub fn value_from_bytes_or(bytes: impl AsRef<[u8]>, default: Value) -> Value {
+    match value_from_bytes(bytes) {
+        Ok(value) => value,
+        Err(_) => default,
+    }
 }
 
 /// 把 Rust 值序列化成紧凑 JSON 字符串。
@@ -300,6 +349,29 @@ mod tests {
         assert_eq!(value["id"], 1);
         assert_eq!(value["tags"][0], "rust");
         Ok(())
+    }
+
+    #[test]
+    fn or_helpers_return_default_on_invalid_json() {
+        let default = User {
+            id: 0,
+            name: "Default".to_owned(),
+        };
+        let parsed: User = from_str_or(r#"{"id":1,"name":"Ada"}"#, default);
+        let fallback: User = from_bytes_or(
+            b"{bad json",
+            User {
+                id: 2,
+                name: "Fallback".to_owned(),
+            },
+        );
+        let value = value_from_str_or("{bad json", value!({ "ok": false }));
+        let bytes = value_from_bytes_or(br#"{"ok":true}"#, value!({ "ok": false }));
+
+        assert_eq!(parsed.name, "Ada");
+        assert_eq!(fallback.name, "Fallback");
+        assert_eq!(value["ok"], false);
+        assert_eq!(bytes["ok"], true);
     }
 
     #[test]
